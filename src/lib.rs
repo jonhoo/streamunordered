@@ -8,14 +8,14 @@ use std::iter::FromIterator;
 use std::marker::PhantomData;
 use std::mem;
 use std::ptr;
-use std::sync::atomic::Ordering::{Relaxed, SeqCst, Acquire, Release, AcqRel};
-use std::sync::atomic::{AtomicPtr, AtomicBool};
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicPtr};
 use std::sync::{Arc, Weak};
 use std::usize;
 
-use futures::{task, Stream, Future, Poll, Async};
-use futures::executor::{self, Notify, UnsafeNotify, NotifyHandle};
+use futures::executor::{self, Notify, NotifyHandle, UnsafeNotify};
 use futures::task::AtomicTask;
+use futures::{task, Async, Future, Poll, Stream};
 
 /// An unbounded set of futures.
 ///
@@ -116,7 +116,8 @@ enum Dequeue<T> {
 }
 
 impl<T> FuturesUnordered<T>
-    where T: Future,
+where
+    T: Future,
 {
     /// Constructs a new, empty `FuturesUnordered`
     ///
@@ -193,7 +194,7 @@ impl<T> FuturesUnordered<T> {
         IterMut {
             node: self.head_all,
             len: self.len,
-            _marker: PhantomData
+            _marker: PhantomData,
         }
     }
 
@@ -237,7 +238,7 @@ impl<T> FuturesUnordered<T> {
 
         self.head_all = ptr;
         self.len += 1;
-        return ptr
+        return ptr;
     }
 
     /// Remove the node from the linked list tracking all nodes currently
@@ -259,12 +260,13 @@ impl<T> FuturesUnordered<T> {
             self.head_all = next;
         }
         self.len -= 1;
-        return node
+        return node;
     }
 }
 
 impl<T> Stream for FuturesUnordered<T>
-    where T: Future
+where
+    T: Future,
 {
     type Item = T::Item;
     type Error = T::Error;
@@ -279,7 +281,7 @@ impl<T> Stream for FuturesUnordered<T>
                     if self.is_empty() {
                         return Ok(Async::Ready(None));
                     } else {
-                        return Ok(Async::NotReady)
+                        return Ok(Async::NotReady);
                     }
                 }
                 Dequeue::Inconsistent => {
@@ -306,7 +308,7 @@ impl<T> Stream for FuturesUnordered<T>
                         let node = ptr2arc(node);
                         assert!((*node.next_all.get()).is_null());
                         assert!((*node.prev_all.get()).is_null());
-                        continue
+                        continue;
                     }
                 };
 
@@ -361,9 +363,7 @@ impl<T> Stream for FuturesUnordered<T>
                 // deallocating the node if need be.
                 let res = {
                     let notify = NodeToHandle(bomb.node.as_ref().unwrap());
-                    executor::with_notify(&notify, 0, || {
-                        future.poll()
-                    })
+                    executor::with_notify(&notify, 0, || future.poll())
                 };
 
                 let ret = match res {
@@ -371,12 +371,12 @@ impl<T> Stream for FuturesUnordered<T>
                         let node = bomb.node.take().unwrap();
                         *node.future.get() = Some(future);
                         bomb.queue.link(node);
-                        continue
+                        continue;
                     }
                     Ok(Async::Ready(e)) => Ok(Async::Ready(Some(e))),
                     Err(e) => Err(e),
                 };
-                return ret
+                return ret;
             }
         }
     }
@@ -419,8 +419,9 @@ impl<T> Drop for FuturesUnordered<T> {
 }
 
 impl<F: Future> FromIterator<F> for FuturesUnordered<F> {
-    fn from_iter<T>(iter: T) -> Self 
-        where T: IntoIterator<Item = F>
+    fn from_iter<T>(iter: T) -> Self
+    where
+        T: IntoIterator<Item = F>,
     {
         let mut new = FuturesUnordered::new();
         for future in iter.into_iter() {
@@ -435,7 +436,7 @@ impl<F: Future> FromIterator<F> for FuturesUnordered<F> {
 pub struct IterMut<'a, F: 'a> {
     node: *const Node<F>,
     len: usize,
-    _marker: PhantomData<&'a mut FuturesUnordered<F>>
+    _marker: PhantomData<&'a mut FuturesUnordered<F>>,
 }
 
 impl<'a, F> Iterator for IterMut<'a, F> {
@@ -649,7 +650,7 @@ impl<T> Drop for Node<T> {
 fn arc2ptr<T>(ptr: Arc<T>) -> *const T {
     let addr = &*ptr as *const T;
     mem::forget(ptr);
-    return addr
+    return addr;
 }
 
 unsafe fn ptr2arc<T>(ptr: *const T) -> Arc<T> {
