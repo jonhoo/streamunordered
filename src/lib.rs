@@ -354,11 +354,6 @@ where
                     }
                 };
 
-                // NOTE: it's a little sad that we remove the stream here only to add it back
-                // immediately after in most cases (i.e., when it is not yet exhausted), as it
-                // may change the stream's index.
-                let mut stream = self.streams.remove(stream);
-
                 // Unset queued flag... this must be done before
                 // polling. This ensures that the stream gets
                 // rescheduled if it is notified **during** a call
@@ -410,20 +405,23 @@ where
                 // deallocating the node if need be.
                 let res = {
                     let notify = NodeToHandle(bomb.node.as_ref().unwrap());
+                    let mut stream = bomb.queue.streams.get_mut(stream).unwrap();
                     executor::with_notify(&notify, 0, || stream.poll())
                 };
 
                 break match res {
                     Ok(Async::NotReady) => {
                         let node = bomb.node.take().unwrap();
-                        *node.stream.get() = Some(bomb.queue.streams.insert(stream));
+                        *node.stream.get() = Some(stream);
                         bomb.queue.link(node);
                         continue;
                     }
-                    Ok(Async::Ready(Some(e))) => {
-                        Ok(Async::Ready(Some((e, bomb.queue.streams.insert(stream)))))
+                    Ok(Async::Ready(Some(e))) => Ok(Async::Ready(Some((e, stream)))),
+                    Ok(Async::Ready(None)) => {
+                        // The stream has completed and should be removed.
+                        drop(bomb.queue.streams.remove(stream));
+                        Ok(Async::Ready(None))
                     }
-                    Ok(Async::Ready(None)) => Ok(Async::Ready(None)),
                     Err(e) => Err(e),
                 };
             }
