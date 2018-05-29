@@ -1,7 +1,17 @@
 [package]
-name = "tokio-indexbag"
+name = "streamunordered"
 version = "0.1.0"
 authors = ["Jon Gjengset <jon@thesquareplanet.com>"]
+license = "MIT/Apache-2.0"
+
+description = "An efficient async stream multiplexer"
+readme = "README.md"
+
+homepage = "https://github.com/jonhoo/streamunordered"
+repository = "https://github.com/jonhoo/streamunordered.git"
+
+categories = ["asynchronous"]
 
 [dependencies]
 futures = "0.1.21"
+slab = "0.4.0"

@@ -1,12 +1,40 @@
-//! An unbounded set of futures.
+//! A stream that efficiently multiplexes multiple streams.
+//!
+//! This "combinator" provides the ability to maintain and drive a set of streams to completion,
+//! while also providing access to each stream as it yields new elements.
+//!
+//! Streams are pushed into this set and their realized values are yielded as they are produced.
+//! This structure is optimized to manage a large number of streams. Streams managed by
+//! `StreamUnordered` will only be polled when they generate notifications. This reduces the
+//! required amount of work needed to coordinate large numbers of streams.
+//!
+//! When a `StreamUnordered` is first created, it does not contain any streams. Calling `poll` in
+//! this state will result in `Ok(Async::Ready(None))` to be returned. Streams are submitted to the
+//! set using `push`; however, the stream will **not** be polled at this point. `StreamUnordered`
+//! will only poll managed streams when `StreamUnordered::poll` is called. As such, it is important
+//! to call `poll` after pushing new streams.
+//!
+//! If `StreamUnordered::poll` returns `Ok(Async::Ready(None))` this means that the set is
+//! currently not managing any streams. A stream may be submitted to the set at a later time. At
+//! that point, a call to `StreamUnordered::poll` will either return the stream's resolved value
+//! **or** `Ok(Async::NotReady)` if the stream has not yet completed.
+//!
+//! Whenever a value is yielded, the yielding stream's index is also included. A reference to the
+//! stream that originated the value is obtained by using [`StreamUnordered::get`] or
+//! [`StreamUnordered::get_mut`].
+
+#![deny(missing_docs)]
+#![deny(missing_debug_implementations)]
 
 extern crate futures;
+extern crate slab;
 
 use std::cell::UnsafeCell;
 use std::fmt::{self, Debug};
 use std::iter::FromIterator;
 use std::marker::PhantomData;
 use std::mem;
+use std::ops::{Index, IndexMut};
 use std::ptr;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 use std::sync::atomic::{AtomicBool, AtomicPtr};
@@ -15,124 +43,109 @@ use std::usize;
 
 use futures::executor::{self, Notify, NotifyHandle, UnsafeNotify};
 use futures::task::AtomicTask;
-use futures::{task, Async, Future, Poll, Stream};
+use futures::{task, Async, Poll, Stream};
 
-/// An unbounded set of futures.
+/// A stream multiplexer.
 ///
-/// This "combinator" also serves a special function in this library, providing
-/// the ability to maintain a set of futures that and manage driving them all
-/// to completion.
-///
-/// Futures are pushed into this set and their realized values are yielded as
-/// they are ready. This structure is optimized to manage a large number of
-/// futures. Futures managed by `FuturesUnordered` will only be polled when they
-/// generate notifications. This reduces the required amount of work needed to
-/// coordinate large numbers of futures.
-///
-/// When a `FuturesUnordered` is first created, it does not contain any futures.
-/// Calling `poll` in this state will result in `Ok(Async::Ready(None))` to be
-/// returned. Futures are submitted to the set using `push`; however, the
-/// future will **not** be polled at this point. `FuturesUnordered` will only
-/// poll managed futures when `FuturesUnordered::poll` is called. As such, it
-/// is important to call `poll` after pushing new futures.
-///
-/// If `FuturesUnordered::poll` returns `Ok(Async::Ready(None))` this means that
-/// the set is currently not managing any futures. A future may be submitted
-/// to the set at a later time. At that point, a call to
-/// `FuturesUnordered::poll` will either return the future's resolved value
-/// **or** `Ok(Async::NotReady)` if the future has not yet completed.
-///
-/// Note that you can create a ready-made `FuturesUnordered` via the
-/// `futures_unordered` function in the `stream` module, or you can start with an
-/// empty set with the `FuturesUnordered::new` constructor.
+/// See the crate-level documentation for details.
 #[must_use = "streams do nothing unless polled"]
-pub struct FuturesUnordered<F> {
-    inner: Arc<Inner<F>>,
-    len: usize,
-    head_all: *const Node<F>,
+pub struct StreamUnordered<F> {
+    inner: Arc<Inner>,
+    streams: slab::Slab<F>,
+    head_all: *const Node,
 }
 
-unsafe impl<T: Send> Send for FuturesUnordered<T> {}
-unsafe impl<T: Sync> Sync for FuturesUnordered<T> {}
+unsafe impl<T: Send> Send for StreamUnordered<T> {}
+unsafe impl<T: Sync> Sync for StreamUnordered<T> {}
 
-// FuturesUnordered is implemented using two linked lists. One which links all
-// futures managed by a `FuturesUnordered` and one that tracks futures that have
+// StreamUnordered is an almost direct clone of futures::stream::FuturesUnordered, but adapted to
+// manage streams instead of futures. Since users may wish to further operate on streams after they
+// yield a value (e.g., by replying on a `TcpStream`), StreamUnordered also include information
+// about what stream each yielded item originated from. It internally maintains a Slab of all
+// managed streams, which can then be accessed by the user through the token they receive along
+// with the yielded values.
+//
+// StreamUnordered is implemented using two linked lists. One which links all
+// streams managed by a `StreamUnordered` and one that tracks streams that have
 // been scheduled for polling. The first linked list is not thread safe and is
-// only accessed by the thread that owns the `FuturesUnordered` value. The
+// only accessed by the thread that owns the `StreamUnordered` value. The
 // second linked list is an implementation of the intrusive MPSC queue algorithm
 // described by 1024cores.net.
 //
-// When a future is submitted to the set a node is allocated and inserted in
+// When a stream is submitted to the set a node is allocated and inserted in
 // both linked lists. The next call to `poll` will (eventually) see this node
-// and call `poll` on the future.
+// and call `poll` on the stream.
 //
-// Before a managed future is polled, the current task's `Notify` is replaced
-// with one that is aware of the specific future being run. This ensures that
-// task notifications generated by that specific future are visible to
-// `FuturesUnordered`. When a notification is received, the node is scheduled
+// Before a managed stream is polled, the current task's `Notify` is replaced
+// with one that is aware of the specific stream being run. This ensures that
+// task notifications generated by that specific stream are visible to
+// `StreamUnordered`. When a notification is received, the node is scheduled
 // for polling by being inserted into the concurrent linked list.
 //
 // Each node uses an `AtomicUsize` to track it's state. The node state is the
 // reference count (the number of outstanding handles to the node) as well as a
 // flag tracking if the node is currently inserted in the atomic queue. When the
-// future is notified, it will only insert itself into the linked list if it
+// stream is notified, it will only insert itself into the linked list if it
 // isn't currently inserted.
+//
+// This implementation could likely be optimized further now that the linked lists no longer need
+// to contain the underlying Futures (as in FuturesUnordered). However, that's a task for later.
 
 #[allow(missing_debug_implementations)]
-struct Inner<T> {
-    // The task using `FuturesUnordered`.
+struct Inner {
+    // The task using `StreamUnordered`.
     parent: AtomicTask,
 
     // Head/tail of the readiness queue
-    head_readiness: AtomicPtr<Node<T>>,
-    tail_readiness: UnsafeCell<*const Node<T>>,
-    stub: Arc<Node<T>>,
+    head_readiness: AtomicPtr<Node>,
+    tail_readiness: UnsafeCell<*const Node>,
+    stub: Arc<Node>,
 }
 
-struct Node<T> {
-    // The future
-    future: UnsafeCell<Option<T>>,
+struct Node {
+    // The stream's index
+    stream: UnsafeCell<Option<usize>>,
 
     // Next pointer for linked list tracking all active nodes
-    next_all: UnsafeCell<*const Node<T>>,
+    next_all: UnsafeCell<*const Node>,
 
     // Previous node in linked list tracking all active nodes
-    prev_all: UnsafeCell<*const Node<T>>,
+    prev_all: UnsafeCell<*const Node>,
 
     // Next pointer in readiness queue
-    next_readiness: AtomicPtr<Node<T>>,
+    next_readiness: AtomicPtr<Node>,
 
     // Queue that we'll be enqueued to when notified
-    queue: Weak<Inner<T>>,
+    queue: Weak<Inner>,
 
     // Whether or not this node is currently in the mpsc queue.
     queued: AtomicBool,
 }
 
-enum Dequeue<T> {
-    Data(*const Node<T>),
+enum Dequeue {
+    Data(*const Node),
     Empty,
     Inconsistent,
 }
 
-impl<T> FuturesUnordered<T>
+impl<T> StreamUnordered<T>
 where
-    T: Future,
+    T: Stream,
 {
-    /// Constructs a new, empty `FuturesUnordered`
+    /// Constructs a new, empty `StreamUnordered`
     ///
-    /// The returned `FuturesUnordered` does not contain any futures and, in this
-    /// state, `FuturesUnordered::poll` will return `Ok(Async::Ready(None))`.
-    pub fn new() -> FuturesUnordered<T> {
+    /// The returned `StreamUnordered` does not contain any streams and, in this
+    /// state, `StreamUnordered::poll` will return `Ok(Async::Ready(None))`.
+    pub fn new() -> StreamUnordered<T> {
         let stub = Arc::new(Node {
-            future: UnsafeCell::new(None),
+            stream: UnsafeCell::new(None),
             next_all: UnsafeCell::new(ptr::null()),
             prev_all: UnsafeCell::new(ptr::null()),
             next_readiness: AtomicPtr::new(ptr::null_mut()),
             queued: AtomicBool::new(true),
             queue: Weak::new(),
         });
-        let stub_ptr = &*stub as *const Node<T>;
+        let stub_ptr = &*stub as *const Node;
         let inner = Arc::new(Inner {
             parent: AtomicTask::new(),
             head_readiness: AtomicPtr::new(stub_ptr as *mut _),
@@ -140,36 +153,37 @@ where
             stub: stub,
         });
 
-        FuturesUnordered {
-            len: 0,
+        StreamUnordered {
+            streams: slab::Slab::new(),
             head_all: ptr::null_mut(),
             inner: inner,
         }
     }
 }
 
-impl<T> FuturesUnordered<T> {
-    /// Returns the number of futures contained in the set.
+impl<T> StreamUnordered<T> {
+    /// Returns the number of streams contained in the set.
     ///
-    /// This represents the total number of in-flight futures.
+    /// This represents the total number of in-flight streams.
     pub fn len(&self) -> usize {
-        self.len
+        self.streams.len()
     }
 
-    /// Returns `true` if the set contains no futures
+    /// Returns `true` if the set contains no streams
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.streams.is_empty()
     }
 
-    /// Push a future into the set.
+    /// Push a stream into the set.
     ///
-    /// This function submits the given future to the set for managing. This
-    /// function will not call `poll` on the submitted future. The caller must
-    /// ensure that `FuturesUnordered::poll` is called in order to receive task
+    /// This function submits the given stream to the set for managing. This
+    /// function will not call `poll` on the submitted stream. The caller must
+    /// ensure that `StreamUnordered::poll` is called in order to receive task
     /// notifications.
-    pub fn push(&mut self, future: T) {
+    pub fn push(&mut self, stream: T) {
+        let stream = self.streams.insert(stream);
         let node = Arc::new(Node {
-            future: UnsafeCell::new(Some(future)),
+            stream: UnsafeCell::new(Some(stream)),
             next_all: UnsafeCell::new(ptr::null_mut()),
             prev_all: UnsafeCell::new(ptr::null_mut()),
             next_readiness: AtomicPtr::new(ptr::null_mut()),
@@ -182,42 +196,58 @@ impl<T> FuturesUnordered<T> {
         // and we'll reclaim ownership through the `unlink` function below.
         let ptr = self.link(node);
 
-        // We'll need to get the future "into the system" to start tracking it,
+        // We'll need to get the stream "into the system" to start tracking it,
         // e.g. getting its unpark notifications going to us tracking which
-        // futures are ready. To do that we unconditionally enqueue it for
+        // streams are ready. To do that we unconditionally enqueue it for
         // polling here.
         self.inner.enqueue(ptr);
     }
 
-    /// Returns an iterator that allows modifying each future in the set.
-    pub fn iter_mut(&mut self) -> IterMut<T> {
-        IterMut {
-            node: self.head_all,
-            len: self.len,
-            _marker: PhantomData,
-        }
+    /// Returns a reference to the stream at the given index.
+    ///
+    /// If the given index is not associated with a stream, then None is returned.
+    ///
+    /// This method is useful for getting a reference to a specific stream after it yielded a
+    /// value.
+    pub fn get(&self, stream: usize) -> Option<&T> {
+        self.streams.get(stream)
     }
 
-    fn release_node(&mut self, node: Arc<Node<T>>) {
-        // The future is done, try to reset the queued flag. This will prevent
-        // `notify` from doing any work in the future
+    /// Returns a mutable reference to the stream at the given index.
+    ///
+    /// If the given index is not associated with a stream, then None is returned.
+    ///
+    /// This method is useful for getting a mutable reference to a specific stream after it yielded
+    /// a value.
+    pub fn get_mut(&mut self, stream: usize) -> Option<&mut T> {
+        self.streams.get_mut(stream)
+    }
+
+    /// Returns an iterator that allows modifying each stream in the set.
+    pub fn iter_mut<'a>(&'a mut self) -> impl Iterator<Item = &'a mut T> {
+        self.streams.iter_mut().map(|(_, s)| s)
+    }
+
+    fn release_node(&mut self, node: Arc<Node>) {
+        // The stream is done, try to reset the queued flag. This will prevent
+        // `notify` from doing any work in the stream
         let prev = node.queued.swap(true, SeqCst);
 
-        // Drop the future, even if it hasn't finished yet. This is safe
-        // because we're dropping the future on the thread that owns
-        // `FuturesUnordered`, which correctly tracks T's lifetimes and such.
-        unsafe {
-            drop((*node.future.get()).take());
+        // Drop the stream, even if it hasn't finished yet. This is safe
+        // because we're dropping the stream on the thread that owns
+        // `StreamUnordered`, which correctly tracks T's lifetimes and such.
+        if let Some(idx) = unsafe { (*node.stream.get()).take() } {
+            drop(self.streams.remove(idx));
         }
 
         // If the queued flag was previously set then it means that this node
         // is still in our internal mpsc queue. We then transfer ownership
         // of our reference count to the mpsc queue, and it'll come along and
-        // free it later, noticing that the future is `None`.
+        // free it later, noticing that the stream is `None`.
         //
         // If, however, the queued flag was *not* set then we're safe to
         // release our reference count on the internal node. The queued flag
-        // was set above so all future `enqueue` operations will not actually
+        // was set above so all stream `enqueue` operations will not actually
         // enqueue the node, so our node will never see the mpsc queue again.
         // The node itself will be deallocated once all reference counts have
         // been dropped by the various owning tasks elsewhere.
@@ -227,7 +257,7 @@ impl<T> FuturesUnordered<T> {
     }
 
     /// Insert a new node into the internal linked list.
-    fn link(&mut self, node: Arc<Node<T>>) -> *const Node<T> {
+    fn link(&mut self, node: Arc<Node>) -> *const Node {
         let ptr = arc2ptr(node);
         unsafe {
             *(*ptr).next_all.get() = self.head_all;
@@ -237,13 +267,12 @@ impl<T> FuturesUnordered<T> {
         }
 
         self.head_all = ptr;
-        self.len += 1;
         return ptr;
     }
 
     /// Remove the node from the linked list tracking all nodes currently
-    /// managed by `FuturesUnordered`.
-    unsafe fn unlink(&mut self, node: *const Node<T>) -> Arc<Node<T>> {
+    /// managed by `StreamUnordered`.
+    unsafe fn unlink(&mut self, node: *const Node) -> Arc<Node> {
         let node = ptr2arc(node);
         let next = *node.next_all.get();
         let prev = *node.prev_all.get();
@@ -259,19 +288,32 @@ impl<T> FuturesUnordered<T> {
         } else {
             self.head_all = next;
         }
-        self.len -= 1;
         return node;
     }
 }
 
-impl<T> Stream for FuturesUnordered<T>
+impl<T> Index<usize> for StreamUnordered<T> {
+    type Output = T;
+
+    fn index(&self, stream: usize) -> &Self::Output {
+        &self.streams[stream]
+    }
+}
+
+impl<T> IndexMut<usize> for StreamUnordered<T> {
+    fn index_mut(&mut self, stream: usize) -> &mut Self::Output {
+        &mut self.streams[stream]
+    }
+}
+
+impl<T> Stream for StreamUnordered<T>
 where
-    T: Future,
+    T: Stream,
 {
-    type Item = T::Item;
+    type Item = (T::Item, usize);
     type Error = T::Error;
 
-    fn poll(&mut self) -> Poll<Option<T::Item>, T::Error> {
+    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
         // Ensure `parent` is correctly set.
         self.inner.parent.register();
 
@@ -297,10 +339,10 @@ where
             debug_assert!(node != self.inner.stub());
 
             unsafe {
-                let mut future = match (*(*node).future.get()).take() {
-                    Some(future) => future,
+                let stream = match (*(*node).stream.get()).take() {
+                    Some(stream) => stream,
 
-                    // If the future has already gone away then we're just
+                    // If the stream has already gone away then we're just
                     // cleaning out this node. See the comment in
                     // `release_node` for more information, but we're basically
                     // just taking ownership of our reference count here.
@@ -312,8 +354,13 @@ where
                     }
                 };
 
+                // NOTE: it's a little sad that we remove the stream here only to add it back
+                // immediately after in most cases (i.e., when it is not yet exhausted), as it
+                // may change the stream's index.
+                let mut stream = self.streams.remove(stream);
+
                 // Unset queued flag... this must be done before
-                // polling. This ensures that the future gets
+                // polling. This ensures that the stream gets
                 // rescheduled if it is notified **during** a call
                 // to `poll`.
                 let prev = (*node).queued.swap(false, SeqCst);
@@ -327,16 +374,16 @@ where
                 // * This "bomb" here will call `release_node` if dropped
                 //   abnormally. That way we'll be sure the memory management
                 //   of the `node` is managed correctly.
-                // * The future was extracted above (taken ownership). That way
-                //   if it panics we're guaranteed that the future is
+                // * The stream was extracted above (taken ownership). That way
+                //   if it panics we're guaranteed that the stream is
                 //   dropped on this thread and doesn't accidentally get
                 //   dropped on a different thread (bad).
                 // * We unlink the node from our internal queue to preemptively
                 //   assume it'll panic, in which case we'll want to discard it
                 //   regardless.
                 struct Bomb<'a, T: 'a> {
-                    queue: &'a mut FuturesUnordered<T>,
-                    node: Option<Arc<Node<T>>>,
+                    queue: &'a mut StreamUnordered<T>,
+                    node: Option<Arc<Node>>,
                 }
                 impl<'a, T> Drop for Bomb<'a, T> {
                     fn drop(&mut self) {
@@ -350,49 +397,51 @@ where
                     queue: self,
                 };
 
-                // Poll the underlying future with the appropriate `notify`
+                // Poll the underlying stream with the appropriate `notify`
                 // implementation. This is where a large bit of the unsafety
                 // starts to stem from internally. The `notify` instance itself
-                // is basically just our `Arc<Node<T>>` and tracks the mpsc
-                // queue of ready futures.
+                // is basically just our `Arc<Node>` and tracks the mpsc
+                // queue of ready streams.
                 //
-                // Critically though `Node<T>` won't actually access `T`, the
-                // future, while it's floating around inside of `Task`
+                // Critically though `Node` won't actually access `T`, the
+                // stream, while it's floating around inside of `Task`
                 // instances. These structs will basically just use `T` to size
                 // the internal allocation, appropriately accessing fields and
                 // deallocating the node if need be.
                 let res = {
                     let notify = NodeToHandle(bomb.node.as_ref().unwrap());
-                    executor::with_notify(&notify, 0, || future.poll())
+                    executor::with_notify(&notify, 0, || stream.poll())
                 };
 
-                let ret = match res {
+                break match res {
                     Ok(Async::NotReady) => {
                         let node = bomb.node.take().unwrap();
-                        *node.future.get() = Some(future);
+                        *node.stream.get() = Some(bomb.queue.streams.insert(stream));
                         bomb.queue.link(node);
                         continue;
                     }
-                    Ok(Async::Ready(e)) => Ok(Async::Ready(Some(e))),
+                    Ok(Async::Ready(Some(e))) => {
+                        Ok(Async::Ready(Some((e, bomb.queue.streams.insert(stream)))))
+                    }
+                    Ok(Async::Ready(None)) => Ok(Async::Ready(None)),
                     Err(e) => Err(e),
                 };
-                return ret;
             }
         }
     }
 }
 
-impl<T: Debug> Debug for FuturesUnordered<T> {
+impl<T: Debug> Debug for StreamUnordered<T> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        write!(fmt, "FuturesUnordered {{ ... }}")
+        write!(fmt, "StreamUnordered {{ ... }}")
     }
 }
 
-impl<T> Drop for FuturesUnordered<T> {
+impl<T> Drop for StreamUnordered<T> {
     fn drop(&mut self) {
-        // When a `FuturesUnordered` is dropped we want to drop all futures associated
+        // When a `StreamUnordered` is dropped we want to drop all streams associated
         // with it. At the same time though there may be tons of `Task` handles
-        // flying around which contain `Node<T>` references inside them. We'll
+        // flying around which contain `Node` references inside them. We'll
         // let those naturally get deallocated when the `Task` itself goes out
         // of scope or gets notified.
         unsafe {
@@ -404,10 +453,10 @@ impl<T> Drop for FuturesUnordered<T> {
         }
 
         // Note that at this point we could still have a bunch of nodes in the
-        // mpsc queue. None of those nodes, however, have futures associated
+        // mpsc queue. None of those nodes, however, have streams associated
         // with them so they're safe to destroy on any thread. At this point
-        // the `FuturesUnordered` struct, the owner of the one strong reference
-        // to `Inner<T>` will drop the strong reference. At that point
+        // the `StreamUnordered` struct, the owner of the one strong reference
+        // to `Inner` will drop the strong reference. At that point
         // whichever thread releases the strong refcount last (be it this
         // thread or some other thread as part of an `upgrade`) will clear out
         // the mpsc queue and free all remaining nodes.
@@ -418,53 +467,22 @@ impl<T> Drop for FuturesUnordered<T> {
     }
 }
 
-impl<F: Future> FromIterator<F> for FuturesUnordered<F> {
+impl<S: Stream> FromIterator<S> for StreamUnordered<S> {
     fn from_iter<T>(iter: T) -> Self
     where
-        T: IntoIterator<Item = F>,
+        T: IntoIterator<Item = S>,
     {
-        let mut new = FuturesUnordered::new();
-        for future in iter.into_iter() {
-            new.push(future);
+        let mut new = StreamUnordered::new();
+        for stream in iter.into_iter() {
+            new.push(stream);
         }
         new
     }
 }
 
-#[derive(Debug)]
-/// Mutable iterator over all futures in the unordered set.
-pub struct IterMut<'a, F: 'a> {
-    node: *const Node<F>,
-    len: usize,
-    _marker: PhantomData<&'a mut FuturesUnordered<F>>,
-}
-
-impl<'a, F> Iterator for IterMut<'a, F> {
-    type Item = &'a mut F;
-
-    fn next(&mut self) -> Option<&'a mut F> {
-        if self.node.is_null() {
-            return None;
-        }
-        unsafe {
-            let future = (*(*self.node).future.get()).as_mut().unwrap();
-            let next = *(*self.node).next_all.get();
-            self.node = next;
-            self.len -= 1;
-            return Some(future);
-        }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.len, Some(self.len))
-    }
-}
-
-impl<'a, F> ExactSizeIterator for IterMut<'a, F> {}
-
-impl<T> Inner<T> {
+impl Inner {
     /// The enqueue function from the 1024cores intrusive MPSC queue algorithm.
-    fn enqueue(&self, node: *const Node<T>) {
+    fn enqueue(&self, node: *const Node) {
         unsafe {
             debug_assert!((*node).queued.load(Relaxed));
 
@@ -482,7 +500,7 @@ impl<T> Inner<T> {
     ///
     /// Note that this unsafe as it required mutual exclusion (only one thread
     /// can call this) to be guaranteed elsewhere.
-    unsafe fn dequeue(&self) -> Dequeue<T> {
+    unsafe fn dequeue(&self) -> Dequeue {
         let mut tail = *self.tail_readiness.get();
         let mut next = (*tail).next_readiness.load(Acquire);
 
@@ -518,19 +536,19 @@ impl<T> Inner<T> {
         Dequeue::Inconsistent
     }
 
-    fn stub(&self) -> *const Node<T> {
+    fn stub(&self) -> *const Node {
         &*self.stub
     }
 }
 
-impl<T> Drop for Inner<T> {
+impl Drop for Inner {
     fn drop(&mut self) {
-        // Once we're in the destructor for `Inner<T>` we need to clear out the
+        // Once we're in the destructor for `Inner` we need to clear out the
         // mpsc queue of nodes if there's anything left in there.
         //
         // Note that each node has a strong reference count associated with it
         // which is owned by the mpsc queue. All nodes should have had their
-        // futures dropped already by the `FuturesUnordered` destructor above,
+        // streams dropped already by the `StreamUnordered` destructor above,
         // so we're just pulling out nodes and dropping their refcounts.
         unsafe {
             loop {
@@ -545,63 +563,63 @@ impl<T> Drop for Inner<T> {
 }
 
 #[allow(missing_debug_implementations)]
-struct NodeToHandle<'a, T: 'a>(&'a Arc<Node<T>>);
+struct NodeToHandle<'a>(&'a Arc<Node>);
 
-impl<'a, T> Clone for NodeToHandle<'a, T> {
+impl<'a> Clone for NodeToHandle<'a> {
     fn clone(&self) -> Self {
         NodeToHandle(self.0)
     }
 }
 
-impl<'a, T> From<NodeToHandle<'a, T>> for NotifyHandle {
-    fn from(handle: NodeToHandle<'a, T>) -> NotifyHandle {
+impl<'a> From<NodeToHandle<'a>> for NotifyHandle {
+    fn from(handle: NodeToHandle<'a>) -> NotifyHandle {
         unsafe {
             let ptr = handle.0.clone();
-            let ptr = mem::transmute::<Arc<Node<T>>, *mut ArcNode<T>>(ptr);
+            let ptr = mem::transmute::<Arc<Node>, *mut ArcNode>(ptr);
             NotifyHandle::new(hide_lt(ptr))
         }
     }
 }
 
-struct ArcNode<T>(PhantomData<T>);
+struct ArcNode(PhantomData<()>);
 
 // We should never touch `T` on any thread other than the one owning
-// `FuturesUnordered`, so this should be a safe operation.
-unsafe impl<T> Send for ArcNode<T> {}
-unsafe impl<T> Sync for ArcNode<T> {}
+// `StreamUnordered`, so this should be a safe operation.
+unsafe impl Send for ArcNode {}
+unsafe impl Sync for ArcNode {}
 
-impl<T> Notify for ArcNode<T> {
+impl Notify for ArcNode {
     fn notify(&self, _id: usize) {
         unsafe {
-            let me: *const ArcNode<T> = self;
-            let me: *const *const ArcNode<T> = &me;
-            let me = me as *const Arc<Node<T>>;
+            let me: *const ArcNode = self;
+            let me: *const *const ArcNode = &me;
+            let me = me as *const Arc<Node>;
             Node::notify(&*me)
         }
     }
 }
 
-unsafe impl<T> UnsafeNotify for ArcNode<T> {
+unsafe impl UnsafeNotify for ArcNode {
     unsafe fn clone_raw(&self) -> NotifyHandle {
-        let me: *const ArcNode<T> = self;
-        let me: *const *const ArcNode<T> = &me;
-        let me = &*(me as *const Arc<Node<T>>);
+        let me: *const ArcNode = self;
+        let me: *const *const ArcNode = &me;
+        let me = &*(me as *const Arc<Node>);
         NodeToHandle(me).into()
     }
 
     unsafe fn drop_raw(&self) {
-        let mut me: *const ArcNode<T> = self;
-        let me = &mut me as *mut *const ArcNode<T> as *mut Arc<Node<T>>;
+        let mut me: *const ArcNode = self;
+        let me = &mut me as *mut *const ArcNode as *mut Arc<Node>;
         ptr::drop_in_place(me);
     }
 }
 
-unsafe fn hide_lt<T>(p: *mut ArcNode<T>) -> *mut UnsafeNotify {
+unsafe fn hide_lt(p: *mut ArcNode) -> *mut UnsafeNotify {
     mem::transmute(p as *mut UnsafeNotify)
 }
 
-impl<T> Node<T> {
-    fn notify(me: &Arc<Node<T>>) {
+impl Node {
+    fn notify(me: &Arc<Node>) {
         let inner = match me.queue.upgrade() {
             Some(inner) => inner,
             None => return,
@@ -617,9 +635,9 @@ impl<T> Node<T> {
         // as it'll want to come along and pick up our node now.
         //
         // Note that we don't change the reference count of the node here,
-        // we're just enqueueing the raw pointer. The `FuturesUnordered`
+        // we're just enqueueing the raw pointer. The `StreamUnordered`
         // implementation guarantees that if we set the `queued` flag true that
-        // there's a reference count held by the main `FuturesUnordered` queue
+        // there's a reference count held by the main `StreamUnordered` queue
         // still.
         let prev = me.queued.swap(true, SeqCst);
         if !prev {
@@ -629,19 +647,19 @@ impl<T> Node<T> {
     }
 }
 
-impl<T> Drop for Node<T> {
+impl Drop for Node {
     fn drop(&mut self) {
-        // Currently a `Node<T>` is sent across all threads for any lifetime,
+        // Currently a `Node` is sent across all threads for any lifetime,
         // regardless of `T`. This means that for memory safety we can't
         // actually touch `T` at any time except when we have a reference to the
-        // `FuturesUnordered` itself.
+        // `StreamUnordered` itself.
         //
-        // Consequently it *should* be the case that we always drop futures from
-        // the `FuturesUnordered` instance, but this is a bomb in place to catch
+        // Consequently it *should* be the case that we always drop streams from
+        // the `StreamUnordered` instance, but this is a bomb in place to catch
         // any bugs in that logic.
         unsafe {
-            if (*self.future.get()).is_some() {
-                abort("future still here when dropping");
+            if (*self.stream.get()).is_some() {
+                abort("stream still here when dropping");
             }
         }
     }
