@@ -1,0 +1,7 @@
+[package]
+name = "tokio-indexbag"
+version = "0.1.0"
+authors = ["Jon Gjengset <jon@thesquareplanet.com>"]
+
+[dependencies]
+futures = "0.1.21"
