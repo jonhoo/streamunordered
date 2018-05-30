@@ -49,14 +49,14 @@ use futures::{task, Async, Poll, Stream};
 ///
 /// See the crate-level documentation for details.
 #[must_use = "streams do nothing unless polled"]
-pub struct StreamUnordered<F> {
+pub struct StreamUnordered<S> {
     inner: Arc<Inner>,
-    streams: slab::Slab<F>,
+    streams: slab::Slab<S>,
     head_all: *const Node,
 }
 
-unsafe impl<T: Send> Send for StreamUnordered<T> {}
-unsafe impl<T: Sync> Sync for StreamUnordered<T> {}
+unsafe impl<S: Send> Send for StreamUnordered<S> {}
+unsafe impl<S: Sync> Sync for StreamUnordered<S> {}
 
 // StreamUnordered is an almost direct clone of futures::stream::FuturesUnordered, but adapted to
 // manage streams instead of futures. Since users may wish to further operate on streams after they
@@ -128,15 +128,18 @@ enum Dequeue {
     Inconsistent,
 }
 
-impl<T> StreamUnordered<T>
-where
-    T: Stream,
-{
+impl<S> Default for StreamUnordered<S> {
+    fn default() -> Self {
+        StreamUnordered::new()
+    }
+}
+
+impl<S> StreamUnordered<S> {
     /// Constructs a new, empty `StreamUnordered`
     ///
     /// The returned `StreamUnordered` does not contain any streams and, in this
     /// state, `StreamUnordered::poll` will return `Ok(Async::Ready(None))`.
-    pub fn new() -> StreamUnordered<T> {
+    pub fn new() -> StreamUnordered<S> {
         let stub = Arc::new(Node {
             stream: UnsafeCell::new(None),
             next_all: UnsafeCell::new(ptr::null()),
@@ -159,9 +162,7 @@ where
             inner: inner,
         }
     }
-}
 
-impl<T> StreamUnordered<T> {
     /// Returns the number of streams contained in the set.
     ///
     /// This represents the total number of in-flight streams.
@@ -180,7 +181,7 @@ impl<T> StreamUnordered<T> {
     /// function will not call `poll` on the submitted stream. The caller must
     /// ensure that `StreamUnordered::poll` is called in order to receive task
     /// notifications.
-    pub fn push(&mut self, stream: T) {
+    pub fn push(&mut self, stream: S) {
         let stream = self.streams.insert(stream);
         let node = Arc::new(Node {
             stream: UnsafeCell::new(Some(stream)),
@@ -209,7 +210,7 @@ impl<T> StreamUnordered<T> {
     ///
     /// This method is useful for getting a reference to a specific stream after it yielded a
     /// value.
-    pub fn get(&self, stream: usize) -> Option<&T> {
+    pub fn get(&self, stream: usize) -> Option<&S> {
         self.streams.get(stream)
     }
 
@@ -219,12 +220,12 @@ impl<T> StreamUnordered<T> {
     ///
     /// This method is useful for getting a mutable reference to a specific stream after it yielded
     /// a value.
-    pub fn get_mut(&mut self, stream: usize) -> Option<&mut T> {
+    pub fn get_mut(&mut self, stream: usize) -> Option<&mut S> {
         self.streams.get_mut(stream)
     }
 
     /// Returns an iterator that allows modifying each stream in the set.
-    pub fn iter_mut<'a>(&'a mut self) -> impl Iterator<Item = &'a mut T> {
+    pub fn iter_mut<'a>(&'a mut self) -> impl Iterator<Item = &'a mut S> {
         self.streams.iter_mut().map(|(_, s)| s)
     }
 
@@ -292,26 +293,26 @@ impl<T> StreamUnordered<T> {
     }
 }
 
-impl<T> Index<usize> for StreamUnordered<T> {
-    type Output = T;
+impl<S> Index<usize> for StreamUnordered<S> {
+    type Output = S;
 
     fn index(&self, stream: usize) -> &Self::Output {
         &self.streams[stream]
     }
 }
 
-impl<T> IndexMut<usize> for StreamUnordered<T> {
+impl<S> IndexMut<usize> for StreamUnordered<S> {
     fn index_mut(&mut self, stream: usize) -> &mut Self::Output {
         &mut self.streams[stream]
     }
 }
 
-impl<T> Stream for StreamUnordered<T>
+impl<S> Stream for StreamUnordered<S>
 where
-    T: Stream,
+    S: Stream,
 {
-    type Item = (T::Item, usize);
-    type Error = T::Error;
+    type Item = (S::Item, usize);
+    type Error = S::Error;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
         // Ensure `parent` is correctly set.
@@ -429,13 +430,13 @@ where
     }
 }
 
-impl<T: Debug> Debug for StreamUnordered<T> {
+impl<S: Debug> Debug for StreamUnordered<S> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         write!(fmt, "StreamUnordered {{ ... }}")
     }
 }
 
-impl<T> Drop for StreamUnordered<T> {
+impl<S> Drop for StreamUnordered<S> {
     fn drop(&mut self) {
         // When a `StreamUnordered` is dropped we want to drop all streams associated
         // with it. At the same time though there may be tons of `Task` handles
@@ -465,10 +466,10 @@ impl<T> Drop for StreamUnordered<T> {
     }
 }
 
-impl<S: Stream> FromIterator<S> for StreamUnordered<S> {
-    fn from_iter<T>(iter: T) -> Self
+impl<S> FromIterator<S> for StreamUnordered<S> {
+    fn from_iter<I>(iter: I) -> Self
     where
-        T: IntoIterator<Item = S>,
+        I: IntoIterator<Item = S>,
     {
         let mut new = StreamUnordered::new();
         for stream in iter.into_iter() {
