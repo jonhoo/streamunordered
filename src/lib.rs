@@ -181,7 +181,12 @@ impl<S> StreamUnordered<S> {
     /// function will not call `poll` on the submitted stream. The caller must
     /// ensure that `StreamUnordered::poll` is called in order to receive task
     /// notifications.
-    pub fn push(&mut self, stream: S) {
+    ///
+    /// The returned token is an identifier that uniquely identifies the given stream. To get a
+    /// handle to the pushed stream, pass the token to [`StreamUnordered::get`] or
+    /// [`StreamUnordered::get_mut`] (or just index `StreamUnordered` directly). The same token
+    /// will be yielded whenever an element is pulled from this stream.
+    pub fn push(&mut self, stream: S) -> usize {
         let stream = self.streams.insert(stream);
         let node = Arc::new(Node {
             stream: UnsafeCell::new(Some(stream)),
@@ -202,6 +207,8 @@ impl<S> StreamUnordered<S> {
         // streams are ready. To do that we unconditionally enqueue it for
         // polling here.
         self.inner.enqueue(ptr);
+
+        stream
     }
 
     /// Returns a reference to the stream at the given index.
