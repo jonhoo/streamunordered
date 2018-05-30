@@ -134,6 +134,62 @@ impl<S> Default for StreamUnordered<S> {
     }
 }
 
+/// A handle to an vacant stream slot in a `StreamUnordered`.
+///
+/// `StreamSlot` allows constructing streams that hold the token that they will be assigned.
+#[derive(Debug)]
+pub struct StreamSlot<'a, S: 'a> {
+    entry: slab::VacantEntry<'a, S>,
+    backref: *mut StreamUnordered<S>,
+}
+
+impl<'a, S: 'a> StreamSlot<'a, S> {
+    /// Insert a stream in the slot, and return a mutable reference to the value.
+    ///
+    /// To get the token associated with the stream, use key prior to calling insert.
+    fn insert(self, stream: S) -> &'a mut S {
+        let token = self.entry.key();
+        {
+            // in a scope so we drop the &mut S
+            self.entry.insert(stream);
+        }
+
+        // safe because the StreamSlot captures the &'a mut StreamUnordered (so it can't be
+        // moved), and the only other ref to anything in StreamUnordered was in the
+        // slab::StreamSlot, which we've now consumed.
+        let this = unsafe { &mut *self.backref };
+
+        let node = Arc::new(Node {
+            stream: UnsafeCell::new(Some(token)),
+            next_all: UnsafeCell::new(ptr::null_mut()),
+            prev_all: UnsafeCell::new(ptr::null_mut()),
+            next_readiness: AtomicPtr::new(ptr::null_mut()),
+            queued: AtomicBool::new(true),
+            queue: Arc::downgrade(&this.inner),
+        });
+
+        // Right now our node has a strong reference count of 1. We transfer
+        // ownership of this reference count to our internal linked list
+        // and we'll reclaim ownership through the `unlink` function below.
+        let ptr = this.link(node);
+
+        // We'll need to get the stream "into the system" to start tracking it,
+        // e.g. getting its unpark notifications going to us tracking which
+        // streams are ready. To do that we unconditionally enqueue it for
+        // polling here.
+        this.inner.enqueue(ptr);
+
+        &mut this[token]
+    }
+
+    /// Return the token associated with this slot.
+    ///
+    /// A stream stored in this slot will be associated with this token.
+    fn token(&self) -> usize {
+        self.entry.key()
+    }
+}
+
 impl<S> StreamUnordered<S> {
     /// Constructs a new, empty `StreamUnordered`
     ///
@@ -175,6 +231,19 @@ impl<S> StreamUnordered<S> {
         self.streams.is_empty()
     }
 
+    /// Returns a handle to a vacant stream slot allowing for further manipulation.
+    ///
+    /// This function is useful when creating values that must contain their stream token. The
+    /// returned `StreamSlot` reserves a slot for the stream and is able to query the associated
+    /// key.
+    pub fn stream_slot(&mut self) -> StreamSlot<S> {
+        let this = self as *mut _;
+        StreamSlot {
+            entry: self.streams.vacant_entry(),
+            backref: this,
+        }
+    }
+
     /// Push a stream into the set.
     ///
     /// This function submits the given stream to the set for managing. This
@@ -187,28 +256,10 @@ impl<S> StreamUnordered<S> {
     /// [`StreamUnordered::get_mut`] (or just index `StreamUnordered` directly). The same token
     /// will be yielded whenever an element is pulled from this stream.
     pub fn push(&mut self, stream: S) -> usize {
-        let stream = self.streams.insert(stream);
-        let node = Arc::new(Node {
-            stream: UnsafeCell::new(Some(stream)),
-            next_all: UnsafeCell::new(ptr::null_mut()),
-            prev_all: UnsafeCell::new(ptr::null_mut()),
-            next_readiness: AtomicPtr::new(ptr::null_mut()),
-            queued: AtomicBool::new(true),
-            queue: Arc::downgrade(&self.inner),
-        });
-
-        // Right now our node has a strong reference count of 1. We transfer
-        // ownership of this reference count to our internal linked list
-        // and we'll reclaim ownership through the `unlink` function below.
-        let ptr = self.link(node);
-
-        // We'll need to get the stream "into the system" to start tracking it,
-        // e.g. getting its unpark notifications going to us tracking which
-        // streams are ready. To do that we unconditionally enqueue it for
-        // polling here.
-        self.inner.enqueue(ptr);
-
-        stream
+        let s = self.stream_slot();
+        let token = s.token();
+        s.insert(stream);
+        token
     }
 
     /// Returns a reference to the stream at the given index.
