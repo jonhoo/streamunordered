@@ -147,7 +147,7 @@ impl<'a, S: 'a> StreamSlot<'a, S> {
     /// Insert a stream in the slot, and return a mutable reference to the value.
     ///
     /// To get the token associated with the stream, use key prior to calling insert.
-    fn insert(self, stream: S) -> &'a mut S {
+    pub fn insert(self, stream: S) -> &'a mut S {
         let token = self.entry.key();
         {
             // in a scope so we drop the &mut S
@@ -185,7 +185,7 @@ impl<'a, S: 'a> StreamSlot<'a, S> {
     /// Return the token associated with this slot.
     ///
     /// A stream stored in this slot will be associated with this token.
-    fn token(&self) -> usize {
+    pub fn token(&self) -> usize {
         self.entry.key()
     }
 }
