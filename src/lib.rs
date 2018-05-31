@@ -475,10 +475,21 @@ where
                         bomb.queue.link(node);
                         continue;
                     }
-                    Ok(Async::Ready(Some(e))) => Ok(Async::Ready(Some((e, stream)))),
+                    Ok(Async::Ready(Some(e))) => {
+                        // Since we got Ready, we have to call poll() again
+                        NotifyHandle::from(NodeToHandle(bomb.node.as_ref().unwrap())).notify(0);
+
+                        // We're also not done with the stream just because it yielded something
+                        let node = bomb.node.take().unwrap();
+                        *node.stream.get() = Some(stream);
+                        bomb.queue.link(node);
+
+                        Ok(Async::Ready(Some((e, stream))))
+                    }
                     Ok(Async::Ready(None)) => {
                         // The stream has completed and should be removed.
                         drop(bomb.queue.streams.remove(stream));
+
                         Ok(Async::Ready(None))
                     }
                     Err(e) => Err(e),
