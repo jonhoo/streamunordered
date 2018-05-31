@@ -12,6 +12,9 @@ repository = "https://github.com/jonhoo/streamunordered.git"
 
 categories = ["asynchronous"]
 
+[badges]
+travis-ci = { repository = "jonhoo/streamunordered" }
+
 [dependencies]
 futures = "0.1.21"
 slab = "0.4.0"
