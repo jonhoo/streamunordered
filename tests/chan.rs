@@ -38,7 +38,6 @@ impl Echoer {
 
     fn try_new(&mut self) -> Result<(), ()> {
         'more: while let Async::Ready(Some((rx, tx))) = self.incoming.poll()? {
-            eprintln!("got connection");
             let slot = self.inputs.stream_slot();
             self.outputs.insert(slot.token(), tx);
             slot.insert(rx);
@@ -51,14 +50,11 @@ impl Echoer {
         for (&stream, out) in &mut self.out {
             let s = self.outputs.get_mut(&stream).unwrap();
             while let Some(x) = out.pop_front() {
-                eprintln!("starting send of {}", x);
                 match s.start_send(x)? {
                     AsyncSink::Ready => {
-                        eprintln!("started");
                         self.pending.insert(stream);
                     }
                     AsyncSink::NotReady(x) => {
-                        eprintln!("delayed");
                         out.push_front(x);
                         break;
                     }
@@ -71,10 +67,7 @@ impl Echoer {
         let outputs = &mut self.outputs;
         self.pending.retain(
             |stream| match outputs.get_mut(stream).unwrap().poll_complete() {
-                Ok(Async::Ready(())) => {
-                    eprintln!("finished a flush");
-                    false
-                }
+                Ok(Async::Ready(())) => false,
                 Ok(Async::NotReady) => true,
                 Err(e) => {
                     err.push(e);
@@ -95,8 +88,6 @@ impl Future for Echoer {
     type Item = ();
     type Error = ();
     fn poll(&mut self) -> Result<Async<Self::Item>, Self::Error> {
-        eprintln!("echoer polled");
-
         // see if there are any new connections
         self.try_new().unwrap();
 
@@ -120,7 +111,6 @@ impl Future for Echoer {
         // send stuff that needs to be sent
         self.try_flush().unwrap();
 
-        eprintln!("echoer finished polling");
         Ok(Async::NotReady)
     }
 }
