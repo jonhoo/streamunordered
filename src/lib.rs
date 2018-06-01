@@ -22,6 +22,12 @@
 //! Whenever a value is yielded, the yielding stream's index is also included. A reference to the
 //! stream that originated the value is obtained by using [`StreamUnordered::get`] or
 //! [`StreamUnordered::get_mut`].
+//!
+//! In normal operation, `poll` will yield a `StreamYield::Item` when it completes successfully.
+//! This value indicates that an underlying stream (the one indicated by the included index)
+//! produced an item. If an underlying stream yields `Async::Ready(None)` to indicate termination,
+//! a `StreamYield::Finished` is returned instead. Note that as soon as a stream is returned in
+//! `StreamYield::Finished`, its token may be reused for new streams that are added.
 
 #![deny(missing_docs)]
 #![deny(missing_debug_implementations)]
@@ -365,11 +371,25 @@ impl<S> IndexMut<usize> for StreamUnordered<S> {
     }
 }
 
+/// An event that occurred for a managed stream.
+#[derive(Debug)]
+pub enum StreamYield<S>
+where
+    S: Stream,
+{
+    /// The underlying stream produced an item.
+    Item(S::Item),
+    /// The underlying stream has completed, and is being returned.
+    ///
+    /// Note that once this value is yielded, the stream's token may be reused.
+    Finished(S),
+}
+
 impl<S> Stream for StreamUnordered<S>
 where
     S: Stream,
 {
-    type Item = (S::Item, usize);
+    type Item = (StreamYield<S>, usize);
     type Error = S::Error;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
@@ -484,13 +504,12 @@ where
                         *node.stream.get() = Some(stream);
                         bomb.queue.link(node);
 
-                        Ok(Async::Ready(Some((e, stream))))
+                        Ok(Async::Ready(Some((StreamYield::Item(e), stream))))
                     }
                     Ok(Async::Ready(None)) => {
                         // The stream has completed and should be removed.
-                        drop(bomb.queue.streams.remove(stream));
-
-                        Ok(Async::Ready(None))
+                        let s = bomb.queue.streams.remove(stream);
+                        Ok(Async::Ready(Some((StreamYield::Finished(s), stream))))
                     }
                     Err(e) => Err(e),
                 };

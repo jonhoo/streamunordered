@@ -88,12 +88,13 @@ impl Future for Echoer {
             // see if there's new input for us
             loop {
                 match self.inputs.poll()? {
-                    Async::Ready(Some((packet, sender))) => {
+                    Async::Ready(Some((StreamYield::Item(packet), sender))) => {
                         self.out
                             .entry(sender)
                             .or_insert_with(VecDeque::new)
                             .push_back(packet);
                     }
+                    Async::Ready(Some((StreamYield::Finished(..), _))) => continue,
                     Async::Ready(None) => {
                         // no connections yet
                         break;
