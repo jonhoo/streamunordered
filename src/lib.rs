@@ -385,6 +385,19 @@ where
     Finished(S),
 }
 
+impl<S> PartialEq for StreamYield<S>
+where
+    S: Stream,
+    S::Item: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (&StreamYield::Item(ref s), &StreamYield::Item(ref o)) => s == o,
+            _ => false,
+        }
+    }
+}
+
 impl<S> Stream for StreamUnordered<S>
 where
     S: Stream,
