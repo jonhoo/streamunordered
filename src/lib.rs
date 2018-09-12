@@ -35,6 +35,9 @@
 extern crate futures;
 extern crate slab;
 
+#[cfg(test)]
+extern crate tokio;
+
 use std::cell::UnsafeCell;
 use std::fmt::{self, Debug};
 use std::iter::FromIterator;
@@ -790,4 +793,39 @@ fn abort(s: &str) -> ! {
 
     let _bomb = DoublePanic;
     panic!("{}", s);
+}
+
+#[cfg(test)]
+mod micro {
+    use super::*;
+    use tokio::prelude::*;
+
+    #[test]
+    fn no_starvation() {
+        let forever0 = Box::new(stream::iter_ok(vec![0].into_iter().cycle()));
+        let forever1 = Box::new(stream::iter_ok(vec![1].into_iter().cycle()));
+        let two = Box::new(stream::iter_ok(vec![2].into_iter()));
+        let mut s = StreamUnordered::new();
+        let forever0 = s.push(forever0 as Box<Stream<Item = i32, Error = ()>>);
+        let forever1 = s.push(forever1 as Box<Stream<Item = i32, Error = ()>>);
+        let two = s.push(two as Box<Stream<Item = i32, Error = ()>>);
+        let mut s = s.wait().take(100);
+        while let Some((v, si)) = s.next().map(Result::unwrap) {
+            if let StreamYield::Item(v) = v {
+                if si == two {
+                    assert_eq!(v, 2);
+                    return;
+                } else if si == forever0 {
+                    assert_eq!(v, 0);
+                } else if si == forever1 {
+                    assert_eq!(v, 1);
+                } else {
+                    unreachable!("unknown stream {} yielded {}", si, v);
+                }
+            } else {
+                unreachable!("unexpected stream end for stream {}", si);
+            }
+        }
+        assert!(false, "stream was starved");
+    }
 }
