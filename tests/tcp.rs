@@ -1,13 +1,12 @@
-extern crate async_bincode;
-extern crate bincode;
-extern crate futures;
-extern crate streamunordered;
-extern crate tokio;
-
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::SocketAddr;
-
 use async_bincode::*;
+use futures_core::{ready, Stream};
+use futures_sink::Sink;
+use futures_util::stream::StreamExt;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use streamunordered::*;
 use tokio::prelude::*;
 
@@ -78,9 +77,8 @@ impl Echoer {
 }
 
 impl Future for Echoer {
-    type Item = ();
-    type Error = ();
-    fn poll(&mut self) -> Result<Async<Self::Item>, Self::Error> {
+    type Output = ();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let res = (|| -> Result<Async<Self::Item>, bincode::Error> {
             // see if there are any new connections
             self.try_new()?;
