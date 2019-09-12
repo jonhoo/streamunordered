@@ -12,7 +12,7 @@ use streamunordered::*;
 use tokio::prelude::*;
 
 struct Echoer {
-    incoming: tokio::net::Incoming,
+    incoming: tokio::net::tcp::Incoming,
     inputs: StreamUnordered<
         AsyncBincodeStream<tokio::net::TcpStream, String, String, AsyncDestination>,
     >,

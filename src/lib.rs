@@ -32,12 +32,6 @@
 #![deny(missing_docs)]
 #![deny(missing_debug_implementations)]
 
-extern crate futures;
-extern crate slab;
-
-#[cfg(test)]
-extern crate tokio;
-
 use std::cell::UnsafeCell;
 use std::fmt::{self, Debug};
 use std::iter::FromIterator;
@@ -500,7 +494,7 @@ where
                 // deallocating the node if need be.
                 let res = {
                     let notify = NodeToHandle(bomb.node.as_ref().unwrap());
-                    let mut stream = bomb.queue.streams.get_mut(stream).unwrap();
+                    let stream = bomb.queue.streams.get_mut(stream).unwrap();
                     executor::with_notify(&notify, 0, || stream.poll())
                 };
 
@@ -717,8 +711,8 @@ unsafe impl UnsafeNotify for ArcNode {
     }
 }
 
-unsafe fn hide_lt(p: *mut ArcNode) -> *mut UnsafeNotify {
-    mem::transmute(p as *mut UnsafeNotify)
+unsafe fn hide_lt(p: *mut ArcNode) -> *mut dyn UnsafeNotify {
+    mem::transmute(p as *mut dyn UnsafeNotify)
 }
 
 impl Node {
@@ -806,9 +800,9 @@ mod micro {
         let forever1 = Box::new(stream::iter_ok(vec![1].into_iter().cycle()));
         let two = Box::new(stream::iter_ok(vec![2].into_iter()));
         let mut s = StreamUnordered::new();
-        let forever0 = s.push(forever0 as Box<Stream<Item = i32, Error = ()>>);
-        let forever1 = s.push(forever1 as Box<Stream<Item = i32, Error = ()>>);
-        let two = s.push(two as Box<Stream<Item = i32, Error = ()>>);
+        let forever0 = s.push(forever0 as Box<dyn Stream<Item = i32, Error = ()>>);
+        let forever1 = s.push(forever1 as Box<dyn Stream<Item = i32, Error = ()>>);
+        let two = s.push(two as Box<dyn Stream<Item = i32, Error = ()>>);
         let mut s = s.wait().take(100);
         while let Some((v, si)) = s.next().map(Result::unwrap) {
             if let StreamYield::Item(v) = v {

@@ -3,6 +3,7 @@ name = "streamunordered"
 version = "0.4.1"
 authors = ["Jon Gjengset <jon@thesquareplanet.com>"]
 license = "MIT/Apache-2.0"
+edition = "2018"
 
 description = "An efficient async stream multiplexer"
 readme = "README.md"
