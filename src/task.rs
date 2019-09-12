@@ -7,35 +7,38 @@ use super::abort::abort;
 use super::ReadyToRunQueue;
 use futures_util::task::{waker_ref, ArcWake, WakerRef};
 
-pub(super) struct Task<Fut> {
-    // The future
-    pub(super) future: UnsafeCell<Option<Fut>>,
+pub(super) struct Task<S> {
+    // The stream
+    pub(super) stream: UnsafeCell<Option<S>>,
 
     // Next pointer for linked list tracking all active tasks
-    pub(super) next_all: UnsafeCell<*const Task<Fut>>,
+    pub(super) next_all: UnsafeCell<*const Task<S>>,
 
     // Previous task in linked list tracking all active tasks
-    pub(super) prev_all: UnsafeCell<*const Task<Fut>>,
+    pub(super) prev_all: UnsafeCell<*const Task<S>>,
 
     // Next pointer in ready to run queue
-    pub(super) next_ready_to_run: AtomicPtr<Task<Fut>>,
+    pub(super) next_ready_to_run: AtomicPtr<Task<S>>,
 
     // Queue that we'll be enqueued to when woken
-    pub(super) ready_to_run_queue: Weak<ReadyToRunQueue<Fut>>,
+    pub(super) ready_to_run_queue: Weak<ReadyToRunQueue<S>>,
 
     // Whether or not this task is currently in the ready to run queue
     pub(super) queued: AtomicBool,
+
+    // A unique identifier for this stream
+    pub(super) id: usize,
 }
 
 // `Task` can be sent across threads safely because it ensures that
-// the underlying `Fut` type isn't touched from any of its methods.
+// the underlying `S` type isn't touched from any of its methods.
 //
-// The parent (`super`) module is trusted not to access `future`
+// The parent (`super`) module is trusted not to access `stream`
 // across different threads.
-unsafe impl<Fut> Send for Task<Fut> {}
-unsafe impl<Fut> Sync for Task<Fut> {}
+unsafe impl<S> Send for Task<S> {}
+unsafe impl<S> Sync for Task<S> {}
 
-impl<Fut> ArcWake for Task<Fut> {
+impl<S> ArcWake for Task<S> {
     fn wake_by_ref(arc_self: &Arc<Self>) {
         let inner = match arc_self.ready_to_run_queue.upgrade() {
             Some(inner) => inner,
@@ -50,9 +53,9 @@ impl<Fut> ArcWake for Task<Fut> {
         // as it'll want to come along and run our task later.
         //
         // Note that we don't change the reference count of the task here,
-        // we merely enqueue the raw pointer. The `FuturesUnordered`
+        // we merely enqueue the raw pointer. The `StreamUnordered`
         // implementation guarantees that if we set the `queued` flag that
-        // there's a reference count held by the main `FuturesUnordered` queue
+        // there's a reference count held by the main `StreamUnordered` queue
         // still.
         let prev = arc_self.queued.swap(true, SeqCst);
         if !prev {
@@ -62,26 +65,26 @@ impl<Fut> ArcWake for Task<Fut> {
     }
 }
 
-impl<Fut> Task<Fut> {
+impl<S> Task<S> {
     /// Returns a waker reference for this task without cloning the Arc.
-    pub(super) fn waker_ref<'a>(this: &'a Arc<Task<Fut>>) -> WakerRef<'a> {
+    pub(super) fn waker_ref<'a>(this: &'a Arc<Task<S>>) -> WakerRef<'a> {
         waker_ref(this)
     }
 }
 
-impl<Fut> Drop for Task<Fut> {
+impl<S> Drop for Task<S> {
     fn drop(&mut self) {
-        // Since `Task<Fut>` is sent across all threads for any lifetime,
-        // regardless of `Fut`, we, to guarantee memory safety, can't actually
-        // touch `Fut` at any time except when we have a reference to the
-        // `FuturesUnordered` itself .
+        // Since `Task<S>` is sent across all threads for any lifetime,
+        // regardless of `S`, we, to guarantee memory safety, can't actually
+        // touch `S` at any time except when we have a reference to the
+        // `StreamUnordered` itself .
         //
-        // Consequently it *should* be the case that we always drop futures from
-        // the `FuturesUnordered` instance. This is a bomb, just in case there's
+        // Consequently it *should* be the case that we always drop streams from
+        // the `StreamUnordered` instance. This is a bomb, just in case there's
         // a bug in that logic.
         unsafe {
-            if (*self.future.get()).is_some() {
-                abort("future still here when dropping");
+            if (*self.stream.get()).is_some() {
+                abort("stream still here when dropping");
             }
         }
     }

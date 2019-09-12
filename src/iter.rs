@@ -1,33 +1,33 @@
-use super::FuturesUnordered;
 use super::task::Task;
+use super::StreamUnordered;
 use core::marker::PhantomData;
 use core::pin::Pin;
 
 #[derive(Debug)]
-/// Mutable iterator over all futures in the unordered set.
-pub struct IterPinMut<'a, Fut> {
-    pub(super) task: *const Task<Fut>,
+/// Mutable iterator over all streams in the unordered set.
+pub struct IterPinMut<'a, S> {
+    pub(super) task: *const Task<S>,
     pub(super) len: usize,
-    pub(super) _marker: PhantomData<&'a mut FuturesUnordered<Fut>>
+    pub(super) _marker: PhantomData<&'a mut StreamUnordered<S>>,
 }
 
 #[derive(Debug)]
-/// Mutable iterator over all futures in the unordered set.
-pub struct IterMut<'a, Fut: Unpin> (pub(super) IterPinMut<'a, Fut>);
+/// Mutable iterator over all streams in the unordered set.
+pub struct IterMut<'a, S: Unpin>(pub(super) IterPinMut<'a, S>);
 
-impl<'a, Fut> Iterator for IterPinMut<'a, Fut> {
-    type Item = Pin<&'a mut Fut>;
+impl<'a, S> Iterator for IterPinMut<'a, S> {
+    type Item = Pin<&'a mut S>;
 
-    fn next(&mut self) -> Option<Pin<&'a mut Fut>> {
+    fn next(&mut self) -> Option<Pin<&'a mut S>> {
         if self.task.is_null() {
             return None;
         }
         unsafe {
-            let future = (*(*self.task).future.get()).as_mut().unwrap();
+            let stream = (*(*self.task).stream.get()).as_mut().unwrap();
             let next = *(*self.task).next_all.get();
             self.task = next;
             self.len -= 1;
-            Some(Pin::new_unchecked(future))
+            Some(Pin::new_unchecked(stream))
         }
     }
 
@@ -36,12 +36,12 @@ impl<'a, Fut> Iterator for IterPinMut<'a, Fut> {
     }
 }
 
-impl<Fut> ExactSizeIterator for IterPinMut<'_, Fut> {}
+impl<S> ExactSizeIterator for IterPinMut<'_, S> {}
 
-impl<'a, Fut: Unpin> Iterator for IterMut<'a, Fut> {
-    type Item = &'a mut Fut;
+impl<'a, S: Unpin> Iterator for IterMut<'a, S> {
+    type Item = &'a mut S;
 
-    fn next(&mut self) -> Option<&'a mut Fut> {
+    fn next(&mut self) -> Option<&'a mut S> {
         self.0.next().map(Pin::get_mut)
     }
 
@@ -50,4 +50,4 @@ impl<'a, Fut: Unpin> Iterator for IterMut<'a, Fut> {
     }
 }
 
-impl<Fut: Unpin> ExactSizeIterator for IterMut<'_, Fut> {}
+impl<S: Unpin> ExactSizeIterator for IterMut<'_, S> {}

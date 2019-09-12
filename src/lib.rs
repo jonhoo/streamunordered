@@ -1,5 +1,8 @@
 //! An unbounded set of streams.
 
+// This is mainly FuturesUnordered from futures_util, but adapted to operate over Streams rather
+// than Futures.
+
 extern crate alloc;
 
 use alloc::sync::{Arc, Weak};
@@ -12,9 +15,8 @@ use core::pin::Pin;
 use core::ptr;
 use core::sync::atomic::Ordering::SeqCst;
 use core::sync::atomic::{AtomicBool, AtomicPtr};
-use futures_core::future::{Future, FutureObj, LocalFutureObj};
 use futures_core::stream::{FusedStream, Stream};
-use futures_core::task::{Context, LocalSpawn, Poll, Spawn, SpawnError};
+use futures_core::task::{Context, Poll};
 use futures_util::task::AtomicWaker;
 
 mod abort;
@@ -28,54 +30,53 @@ use self::task::Task;
 mod ready_to_run_queue;
 use self::ready_to_run_queue::{Dequeue, ReadyToRunQueue};
 
-/// Constant used for a `FuturesUnordered` to indicate we are empty and have
+/// Constant used for a `StreamUnordered` to indicate we are empty and have
 /// yielded a `None` element so can return `true` from
 /// `FusedStream::is_terminated`
 ///
-/// It is safe to not check for this when incrementing as even a ZST future will
+/// It is safe to not check for this when incrementing as even a ZST stream will
 /// have a `Task` allocated for it, so we cannot ever reach usize::max_value()
 /// without running out of ram.
 const TERMINATED_SENTINEL_LENGTH: usize = usize::max_value();
 
-/// A set of futures which may complete in any order.
+/// A set of streams which may yield items in any order.
 ///
-/// This structure is optimized to manage a large number of futures.
-/// Futures managed by [`FuturesUnordered`] will only be polled when they
+/// This structure is optimized to manage a large number of streams.
+/// Streams managed by [`StreamUnordered`] will only be polled when they
 /// generate wake-up notifications. This reduces the required amount of work
-/// needed to poll large numbers of futures.
+/// needed to poll large numbers of streams.
 ///
-/// [`FuturesUnordered`] can be filled by [`collect`](Iterator::collect)ing an
-/// iterator of futures into a [`FuturesUnordered`], or by
-/// [`push`](FuturesUnordered::push)ing futures onto an existing
-/// [`FuturesUnordered`]. When new futures are added,
+/// [`StreamUnordered`] can be filled by [`collect`](Iterator::collect)ing an
+/// iterator of streams into a [`StreamUnordered`], or by
+/// [`push`](StreamUnordered::push)ing streams onto an existing
+/// [`StreamUnordered`]. When new streams are added,
 /// [`poll_next`](Stream::poll_next) must be called in order to begin receiving
-/// wake-ups for new futures.
+/// wake-ups for new streams.
 ///
-/// Note that you can create a ready-made [`FuturesUnordered`] via the
+/// Note that you can create a ready-made [`StreamUnordered`] via the
 /// [`collect`](Iterator::collect) method, or you can start with an empty set
-/// with the [`FuturesUnordered::new`] constructor.
-///
-/// This type is only available when the `std` or `alloc` feature of this
-/// library is activated, and it is activated by default.
+/// with the [`StreamUnordered::new`] constructor.
 #[must_use = "streams do nothing unless polled"]
-pub struct FuturesUnordered<Fut> {
-    ready_to_run_queue: Arc<ReadyToRunQueue<Fut>>,
+pub struct StreamUnordered<S> {
+    ready_to_run_queue: Arc<ReadyToRunQueue<S>>,
     len: usize,
-    head_all: *const Task<Fut>,
+    head_all: *const Task<S>,
+    next_id: usize,
 }
 
-unsafe impl<Fut: Send> Send for FuturesUnordered<Fut> {}
-unsafe impl<Fut: Sync> Sync for FuturesUnordered<Fut> {}
-impl<Fut> Unpin for FuturesUnordered<Fut> {}
+unsafe impl<S: Send> Send for StreamUnordered<S> {}
+unsafe impl<S: Sync> Sync for StreamUnordered<S> {}
+impl<S> Unpin for StreamUnordered<S> {}
 
-impl Spawn for FuturesUnordered<FutureObj<'_, ()>> {
+/*
+impl Spawn for StreamUnordered<FutureObj<'_, ()>> {
     fn spawn_obj(&mut self, future_obj: FutureObj<'static, ()>) -> Result<(), SpawnError> {
         self.push(future_obj);
         Ok(())
     }
 }
 
-impl LocalSpawn for FuturesUnordered<LocalFutureObj<'_, ()>> {
+impl LocalSpawn for StreamUnordered<LocalFutureObj<'_, ()>> {
     fn spawn_local_obj(
         &mut self,
         future_obj: LocalFutureObj<'static, ()>,
@@ -84,23 +85,24 @@ impl LocalSpawn for FuturesUnordered<LocalFutureObj<'_, ()>> {
         Ok(())
     }
 }
+*/
 
-// FuturesUnordered is implemented using two linked lists. One which links all
-// futures managed by a `FuturesUnordered` and one that tracks futures that have
+// StreamUnordered is implemented using two linked lists. One which links all
+// streams managed by a `StreamUnordered` and one that tracks streams that have
 // been scheduled for polling. The first linked list is not thread safe and is
-// only accessed by the thread that owns the `FuturesUnordered` value. The
+// only accessed by the thread that owns the `StreamUnordered` value. The
 // second linked list is an implementation of the intrusive MPSC queue algorithm
 // described by 1024cores.net.
 //
-// When a future is submitted to the set, a task is allocated and inserted in
+// When a stream is submitted to the set, a task is allocated and inserted in
 // both linked lists. The next call to `poll_next` will (eventually) see this
-// task and call `poll` on the future.
+// task and call `poll` on the stream.
 //
-// Before a managed future is polled, the current context's waker is replaced
-// with one that is aware of the specific future being run. This ensures that
-// wake-up notifications generated by that specific future are visible to
-// `FuturesUnordered`. When a wake-up notification is received, the task is
-// inserted into the ready to run queue, so that its future can be polled later.
+// Before a managed stream is polled, the current context's waker is replaced
+// with one that is aware of the specific stream being run. This ensures that
+// wake-up notifications generated by that specific stream are visible to
+// `StreamUnordered`. When a wake-up notification is received, the task is
+// inserted into the ready to run queue, so that its stream can be polled later.
 //
 // Each task is wrapped in an `Arc` and thereby atomically reference counted.
 // Also, each task contains an `AtomicBool` which acts as a flag that indicates
@@ -108,22 +110,75 @@ impl LocalSpawn for FuturesUnordered<LocalFutureObj<'_, ()>> {
 // notifiaction is received, the task will only be inserted into the ready to
 // run queue if it isn't inserted already.
 
-impl<Fut: Future> FuturesUnordered<Fut> {
-    /// Constructs a new, empty [`FuturesUnordered`].
+/// A handle to an vacant stream slot in a `StreamUnordered`.
+///
+/// `StreamSlot` allows constructing streams that hold the token that they will be assigned.
+#[derive(Debug)]
+pub struct StreamSlot<'a, S: 'a> {
+    token: usize,
+    backref: &'a mut StreamUnordered<S>,
+}
+
+impl<'a, S: 'a> StreamSlot<'a, S> {
+    /// Insert a stream in the slot, and return a mutable reference to the value.
     ///
-    /// The returned [`FuturesUnordered`] does not contain any futures.
-    /// In this state, [`FuturesUnordered::poll_next`](Stream::poll_next) will
+    /// To get the token associated with the stream, use key prior to calling insert.
+    pub fn insert(self, stream: S) {
+        let task = Arc::new(Task {
+            stream: UnsafeCell::new(Some(stream)),
+            next_all: UnsafeCell::new(ptr::null_mut()),
+            prev_all: UnsafeCell::new(ptr::null_mut()),
+            next_ready_to_run: AtomicPtr::new(ptr::null_mut()),
+            queued: AtomicBool::new(true),
+            ready_to_run_queue: Arc::downgrade(&self.backref.ready_to_run_queue),
+            id: self.token,
+        });
+
+        self.backref.next_id += 1;
+
+        // If we've previously marked ourselves as terminated we need to reset
+        // len to 0 to track it correctly
+        if self.backref.len == TERMINATED_SENTINEL_LENGTH {
+            self.backref.len = 0;
+        }
+
+        // Right now our task has a strong reference count of 1. We transfer
+        // ownership of this reference count to our internal linked list
+        // and we'll reclaim ownership through the `unlink` method below.
+        let ptr = self.backref.link(task);
+
+        // We'll need to get the stream "into the system" to start tracking it,
+        // e.g. getting its wake-up notifications going to us tracking which
+        // streams are ready. To do that we unconditionally enqueue it for
+        // polling here.
+        self.backref.ready_to_run_queue.enqueue(ptr);
+    }
+
+    /// Return the token associated with this slot.
+    ///
+    /// A stream stored in this slot will be associated with this token.
+    pub fn token(&self) -> usize {
+        self.token
+    }
+}
+
+impl<S: Stream> StreamUnordered<S> {
+    /// Constructs a new, empty [`StreamUnordered`].
+    ///
+    /// The returned [`StreamUnordered`] does not contain any streams.
+    /// In this state, [`StreamUnordered::poll_next`](Stream::poll_next) will
     /// return [`Poll::Ready(None)`](Poll::Ready).
-    pub fn new() -> FuturesUnordered<Fut> {
+    pub fn new() -> StreamUnordered<S> {
         let stub = Arc::new(Task {
-            future: UnsafeCell::new(None),
+            stream: UnsafeCell::new(None),
             next_all: UnsafeCell::new(ptr::null()),
             prev_all: UnsafeCell::new(ptr::null()),
             next_ready_to_run: AtomicPtr::new(ptr::null_mut()),
             queued: AtomicBool::new(true),
             ready_to_run_queue: Weak::new(),
+            id: 0,
         });
-        let stub_ptr = &*stub as *const Task<Fut>;
+        let stub_ptr = &*stub as *const Task<S>;
         let ready_to_run_queue = Arc::new(ReadyToRunQueue {
             waker: AtomicWaker::new(),
             head: AtomicPtr::new(stub_ptr as *mut _),
@@ -131,24 +186,25 @@ impl<Fut: Future> FuturesUnordered<Fut> {
             stub,
         });
 
-        FuturesUnordered {
+        StreamUnordered {
             len: 0,
             head_all: ptr::null_mut(),
             ready_to_run_queue,
+            next_id: 1,
         }
     }
 }
 
-impl<Fut: Future> Default for FuturesUnordered<Fut> {
-    fn default() -> FuturesUnordered<Fut> {
-        FuturesUnordered::new()
+impl<S: Stream> Default for StreamUnordered<S> {
+    fn default() -> StreamUnordered<S> {
+        StreamUnordered::new()
     }
 }
 
-impl<Fut> FuturesUnordered<Fut> {
-    /// Returns the number of futures contained in the set.
+impl<S> StreamUnordered<S> {
+    /// Returns the number of streams contained in the set.
     ///
-    /// This represents the total number of in-flight futures.
+    /// This represents the total number of in-flight streams.
     pub fn len(&self) -> usize {
         if self.len == TERMINATED_SENTINEL_LENGTH {
             0
@@ -157,55 +213,49 @@ impl<Fut> FuturesUnordered<Fut> {
         }
     }
 
-    /// Returns `true` if the set contains no futures.
+    /// Returns `true` if the set contains no streams.
     pub fn is_empty(&self) -> bool {
         self.len == 0 || self.len == TERMINATED_SENTINEL_LENGTH
     }
 
-    /// Push a future into the set.
+    /// Returns a handle to a vacant stream slot allowing for further manipulation.
     ///
-    /// This method adds the given future to the set. This method will not
-    /// call [`poll`](core::future::Future::poll) on the submitted future. The caller must
-    /// ensure that [`FuturesUnordered::poll_next`](Stream::poll_next) is called
-    /// in order to receive wake-up notifications for the given future.
-    pub fn push(&mut self, future: Fut) {
-        let task = Arc::new(Task {
-            future: UnsafeCell::new(Some(future)),
-            next_all: UnsafeCell::new(ptr::null_mut()),
-            prev_all: UnsafeCell::new(ptr::null_mut()),
-            next_ready_to_run: AtomicPtr::new(ptr::null_mut()),
-            queued: AtomicBool::new(true),
-            ready_to_run_queue: Arc::downgrade(&self.ready_to_run_queue),
-        });
-
-        // If we've previously marked ourselves as terminated we need to reset
-        // len to 0 to track it correctly
-        if self.len == TERMINATED_SENTINEL_LENGTH {
-            self.len = 0;
+    /// This function is useful when creating values that must contain their stream token. The
+    /// returned `StreamSlot` reserves a slot for the stream and is able to query the associated
+    /// key.
+    pub fn stream_slot(&mut self) -> StreamSlot<S> {
+        StreamSlot {
+            token: self.next_id,
+            backref: self,
         }
-
-        // Right now our task has a strong reference count of 1. We transfer
-        // ownership of this reference count to our internal linked list
-        // and we'll reclaim ownership through the `unlink` method below.
-        let ptr = self.link(task);
-
-        // We'll need to get the future "into the system" to start tracking it,
-        // e.g. getting its wake-up notifications going to us tracking which
-        // futures are ready. To do that we unconditionally enqueue it for
-        // polling here.
-        self.ready_to_run_queue.enqueue(ptr);
     }
 
-    /// Returns an iterator that allows modifying each future in the set.
-    pub fn iter_mut(&mut self) -> IterMut<'_, Fut>
+    /// Push a stream into the set.
+    ///
+    /// This method adds the given stream to the set. This method will not
+    /// call [`poll_next`](futures_util::stream::Stream::poll_next) on the submitted steam. The
+    /// caller must ensure that [`StreamUnordered::poll_next`](Stream::poll_next) is called
+    /// in order to receive wake-up notifications for the given stream.
+    ///
+    /// The returned token is an identifier that uniquely identifies the given stream.
+    /// The same token will be yielded whenever an element is pulled from this stream.
+    pub fn push(&mut self, stream: S) -> usize {
+        let s = self.stream_slot();
+        let token = s.token();
+        s.insert(stream);
+        token
+    }
+
+    /// Returns an iterator that allows modifying each stream in the set.
+    pub fn iter_mut(&mut self) -> IterMut<'_, S>
     where
-        Fut: Unpin,
+        S: Unpin,
     {
         IterMut(Pin::new(self).iter_pin_mut())
     }
 
-    /// Returns an iterator that allows modifying each future in the set.
-    pub fn iter_pin_mut(self: Pin<&mut Self>) -> IterPinMut<'_, Fut> {
+    /// Returns an iterator that allows modifying each stream in the set.
+    pub fn iter_pin_mut(self: Pin<&mut Self>) -> IterPinMut<'_, S> {
         IterPinMut {
             task: self.head_all,
             len: self.len(),
@@ -213,38 +263,38 @@ impl<Fut> FuturesUnordered<Fut> {
         }
     }
 
-    /// Releases the task. It destorys the future inside and either drops
+    /// Releases the task. It destorys the stream inside and either drops
     /// the `Arc<Task>` or transfers ownership to the ready to run queue.
     /// The task this method is called on must have been unlinked before.
-    fn release_task(&mut self, task: Arc<Task<Fut>>) {
+    fn release_task(&mut self, task: Arc<Task<S>>) {
         // `release_task` must only be called on unlinked tasks
         unsafe {
             debug_assert!((*task.next_all.get()).is_null());
             debug_assert!((*task.prev_all.get()).is_null());
         }
 
-        // The future is done, try to reset the queued flag. This will prevent
-        // `wake` from doing any work in the future
+        // The stream is done, try to reset the queued flag. This will prevent
+        // `wake` from doing any work in the stream
         let prev = task.queued.swap(true, SeqCst);
 
-        // Drop the future, even if it hasn't finished yet. This is safe
-        // because we're dropping the future on the thread that owns
-        // `FuturesUnordered`, which correctly tracks `Fut`'s lifetimes and
+        // Drop the stream, even if it hasn't finished yet. This is safe
+        // because we're dropping the stream on the thread that owns
+        // `StreamUnordered`, which correctly tracks `S`'s lifetimes and
         // such.
         unsafe {
             // Set to `None` rather than `take()`ing to prevent moving the
-            // future.
-            *task.future.get() = None;
+            // stream.
+            *task.stream.get() = None;
         }
 
         // If the queued flag was previously set, then it means that this task
         // is still in our internal ready to run queue. We then transfer
         // ownership of our reference count to the ready to run queue, and it'll
-        // come along and free it later, noticing that the future is `None`.
+        // come along and free it later, noticing that the stream is `None`.
         //
         // If, however, the queued flag was *not* set then we're safe to
         // release our reference count on the task. The queued flag was set
-        // above so all future `enqueue` operations will not actually
+        // above so all stream `enqueue` operations will not actually
         // enqueue the task, so our task will never see the ready to run queue
         // again. The task itself will be deallocated once all reference counts
         // have been dropped elsewhere by the various wakers that contain it.
@@ -254,7 +304,7 @@ impl<Fut> FuturesUnordered<Fut> {
     }
 
     /// Insert a new task into the internal linked list.
-    fn link(&mut self, task: Arc<Task<Fut>>) -> *const Task<Fut> {
+    fn link(&mut self, task: Arc<Task<S>>) -> *const Task<S> {
         let ptr = Arc::into_raw(task);
         unsafe {
             *(*ptr).next_all.get() = self.head_all;
@@ -269,10 +319,10 @@ impl<Fut> FuturesUnordered<Fut> {
     }
 
     /// Remove the task from the linked list tracking all tasks currently
-    /// managed by `FuturesUnordered`.
+    /// managed by `StreamUnordered`.
     /// This method is unsafe because it has be guaranteed that `task` is a
     /// valid pointer.
-    unsafe fn unlink(&mut self, task: *const Task<Fut>) -> Arc<Task<Fut>> {
+    unsafe fn unlink(&mut self, task: *const Task<S>) -> Arc<Task<S>> {
         let task = Arc::from_raw(task);
         let next = *task.next_all.get();
         let prev = *task.prev_all.get();
@@ -293,8 +343,33 @@ impl<Fut> FuturesUnordered<Fut> {
     }
 }
 
-impl<Fut: Future> Stream for FuturesUnordered<Fut> {
-    type Item = Fut::Output;
+/// An event that occurred for a managed stream.
+#[derive(Debug)]
+pub enum StreamYield<S>
+where
+    S: Stream,
+{
+    /// The underlying stream produced an item.
+    Item(S::Item),
+    /// The underlying stream has completed.
+    Finished,
+}
+
+impl<S> PartialEq for StreamYield<S>
+where
+    S: Stream,
+    S::Item: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (&StreamYield::Item(ref s), &StreamYield::Item(ref o)) => s == o,
+            _ => false,
+        }
+    }
+}
+
+impl<S: Stream> Stream for StreamUnordered<S> {
+    type Item = (StreamYield<S>, usize);
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // Ensure `parent` is correctly set.
@@ -329,11 +404,11 @@ impl<Fut: Future> Stream for FuturesUnordered<Fut> {
             // Safety:
             // - `task` is a valid pointer.
             // - We are the only thread that accesses the `UnsafeCell` that
-            //   contains the future
-            let future = match unsafe { &mut *(*task).future.get() } {
-                Some(future) => future,
+            //   contains the stream
+            let stream = match unsafe { &mut *(*task).stream.get() } {
+                Some(stream) => stream,
 
-                // If the future has already gone away then we're just
+                // If the stream has already gone away then we're just
                 // cleaning out this task. See the comment in
                 // `release_task` for more information, but we're basically
                 // just taking ownership of our reference count here.
@@ -360,7 +435,7 @@ impl<Fut: Future> Stream for FuturesUnordered<Fut> {
             let task = unsafe { self.unlink(task) };
 
             // Unset queued flag: This must be done before polling to ensure
-            // that the future's task gets rescheduled if it sends a wake-up
+            // that the stream's task gets rescheduled if it sends a wake-up
             // notification **during** the call to `poll`.
             let prev = task.queued.swap(false, SeqCst);
             assert!(prev);
@@ -373,18 +448,18 @@ impl<Fut: Future> Stream for FuturesUnordered<Fut> {
             // * A "bomb" is created which if dropped abnormally will call
             //   `release_task`. That way we'll be sure the memory management
             //   of the `task` is managed correctly. In particular
-            //   `release_task` will drop the future. This ensures that it is
+            //   `release_task` will drop the steam. This ensures that it is
             //   dropped on this thread and not accidentally on a different
             //   thread (bad).
             // * We unlink the task from our internal queue to preemptively
             //   assume it'll panic, in which case we'll want to discard it
             //   regardless.
-            struct Bomb<'a, Fut> {
-                queue: &'a mut FuturesUnordered<Fut>,
-                task: Option<Arc<Task<Fut>>>,
+            struct Bomb<'a, S> {
+                queue: &'a mut StreamUnordered<S>,
+                task: Option<Arc<Task<S>>>,
             }
 
-            impl<Fut> Drop for Bomb<'_, Fut> {
+            impl<S> Drop for Bomb<'_, S> {
                 fn drop(&mut self) {
                     if let Some(task) = self.task.take() {
                         self.queue.release_task(task);
@@ -392,30 +467,31 @@ impl<Fut: Future> Stream for FuturesUnordered<Fut> {
                 }
             }
 
+            let id = task.id;
             let mut bomb = Bomb {
                 task: Some(task),
                 queue: &mut *self,
             };
 
-            // Poll the underlying future with the appropriate waker
+            // Poll the underlying stream with the appropriate waker
             // implementation. This is where a large bit of the unsafety
             // starts to stem from internally. The waker is basically just
-            // our `Arc<Task<Fut>>` and can schedule the future for polling by
+            // our `Arc<Task<S>>` and can schedule the stream for polling by
             // enqueuing itself in the ready to run queue.
             //
-            // Critically though `Task<Fut>` won't actually access `Fut`, the
-            // future, while it's floating around inside of wakers.
-            // These structs will basically just use `Fut` to size
+            // Critically though `Task<S>` won't actually access `S`, the
+            // stream, while it's floating around inside of wakers.
+            // These structs will basically just use `S` to size
             // the internal allocation, appropriately accessing fields and
             // deallocating the task if need be.
             let res = {
                 let waker = Task::waker_ref(bomb.task.as_ref().unwrap());
                 let mut cx = Context::from_waker(&waker);
 
-                // Safety: We won't move the future ever again
-                let future = unsafe { Pin::new_unchecked(future) };
+                // Safety: We won't move the stream ever again
+                let stream = unsafe { Pin::new_unchecked(stream) };
 
-                future.poll(&mut cx)
+                stream.poll_next(&mut cx)
             };
 
             match res {
@@ -424,7 +500,19 @@ impl<Fut: Future> Stream for FuturesUnordered<Fut> {
                     bomb.queue.link(task);
                     continue;
                 }
-                Poll::Ready(output) => return Poll::Ready(Some(output)),
+                Poll::Ready(None) => {
+                    // The stream has completed and should be removed.
+                    // Dropping the bomb will do that.
+                    // NOTE: it'd be nice if we could yield the stream itself if Unpin here
+                    return Poll::Ready(Some((StreamYield::Finished, id)));
+                }
+                Poll::Ready(Some(output)) => {
+                    // We're not done with the stream just because it yielded something
+                    let task = bomb.task.take().unwrap();
+                    bomb.queue.link(task);
+
+                    return Poll::Ready(Some((StreamYield::Item(output), id)));
+                }
             }
         }
     }
@@ -437,17 +525,17 @@ impl<Fut: Future> Stream for FuturesUnordered<Fut> {
     */
 }
 
-impl<Fut> Debug for FuturesUnordered<Fut> {
+impl<S> Debug for StreamUnordered<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "FuturesUnordered {{ ... }}")
+        write!(f, "StreamUnordered {{ ... }}")
     }
 }
 
-impl<Fut> Drop for FuturesUnordered<Fut> {
+impl<S> Drop for StreamUnordered<S> {
     fn drop(&mut self) {
-        // When a `FuturesUnordered` is dropped we want to drop all futures
+        // When a `StreamUnordered` is dropped we want to drop all streams
         // associated with it. At the same time though there may be tons of
-        // wakers flying around which contain `Task<Fut>` references
+        // wakers flying around which contain `Task<S>` references
         // inside them. We'll let those naturally get deallocated.
         unsafe {
             while !self.head_all.is_null() {
@@ -458,9 +546,9 @@ impl<Fut> Drop for FuturesUnordered<Fut> {
         }
 
         // Note that at this point we could still have a bunch of tasks in the
-        // ready to run queue. None of those tasks, however, have futures
+        // ready to run queue. None of those tasks, however, have streams
         // associated with them so they're safe to destroy on any thread. At
-        // this point the `FuturesUnordered` struct, the owner of the one strong
+        // this point the `StreamUnordered` struct, the owner of the one strong
         // reference to the ready to run queue will drop the strong reference.
         // At that point whichever thread releases the strong refcount last (be
         // it this thread or some other thread as part of an `upgrade`) will
@@ -472,12 +560,12 @@ impl<Fut> Drop for FuturesUnordered<Fut> {
     }
 }
 
-impl<Fut: Future> FromIterator<Fut> for FuturesUnordered<Fut> {
+impl<S: Stream> FromIterator<S> for StreamUnordered<S> {
     fn from_iter<I>(iter: I) -> Self
     where
-        I: IntoIterator<Item = Fut>,
+        I: IntoIterator<Item = S>,
     {
-        let acc = FuturesUnordered::new();
+        let acc = StreamUnordered::new();
         iter.into_iter().fold(acc, |mut acc, item| {
             acc.push(item);
             acc
@@ -485,7 +573,7 @@ impl<Fut: Future> FromIterator<Fut> for FuturesUnordered<Fut> {
     }
 }
 
-impl<Fut: Future> FusedStream for FuturesUnordered<Fut> {
+impl<S: Stream> FusedStream for StreamUnordered<S> {
     fn is_terminated(&self) -> bool {
         self.len == TERMINATED_SENTINEL_LENGTH
     }
