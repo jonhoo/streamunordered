@@ -1,4 +1,36 @@
-//! An unbounded set of streams.
+//! A stream that efficiently multiplexes multiple streams.
+//!
+//! This "combinator" provides the ability to maintain and drive a set of streams to completion,
+//! while also providing access to each stream as it yields new elements.
+//!
+//! Streams are pushed into this set and their realized values are yielded as they are produced.
+//! This structure is optimized to manage a large number of streams. Streams managed by
+//! `StreamUnordered` will only be polled when they generate notifications. This reduces the
+//! required amount of work needed to coordinate large numbers of streams.
+//!
+//! When a `StreamUnordered` is first created, it does not contain any streams. Calling `poll` in
+//! this state will result in `Poll::Ready((None)` to be returned. Streams are submitted to the
+//! set using `push`; however, the stream will **not** be polled at this point. `StreamUnordered`
+//! will only poll managed streams when `StreamUnordered::poll` is called. As such, it is important
+//! to call `poll` after pushing new streams.
+//!
+//! If `StreamUnordered::poll` returns `Poll::Ready(None)` this means that the set is
+//! currently not managing any streams. A stream may be submitted to the set at a later time. At
+//! that point, a call to `StreamUnordered::poll` will either return the stream's resolved value
+//! **or** `Poll::Pending` if the stream has not yet completed.
+//!
+//! Whenever a value is yielded, the yielding stream's index is also included. A reference to the
+//! stream that originated the value is obtained by using [`StreamUnordered::get`],
+//! [`StreamUnordered::get_mut`], or [`StreamUnordered::get_pin_mut`].
+//!
+//! In normal operation, `poll` will yield a `StreamYield::Item` when it completes successfully.
+//! This value indicates that an underlying stream (the one indicated by the included index)
+//! produced an item. If an underlying stream yields `Poll::Ready(None)` to indicate termination,
+//! a `StreamYield::Finished` is returned instead. Note that as soon as a stream returns
+//! `StreamYield::Finished`, its token may be reused for new streams that are added.
+
+#![deny(missing_docs)]
+#![warn(rust_2018_idioms)]
 
 // This is mainly FuturesUnordered from futures_util, but adapted to operate over Streams rather
 // than Futures.
@@ -69,25 +101,6 @@ unsafe impl<S: Send> Send for StreamUnordered<S> {}
 unsafe impl<S: Sync> Sync for StreamUnordered<S> {}
 impl<S> Unpin for StreamUnordered<S> {}
 
-/*
-impl Spawn for StreamUnordered<FutureObj<'_, ()>> {
-    fn spawn_obj(&mut self, future_obj: FutureObj<'static, ()>) -> Result<(), SpawnError> {
-        self.push(future_obj);
-        Ok(())
-    }
-}
-
-impl LocalSpawn for StreamUnordered<LocalFutureObj<'_, ()>> {
-    fn spawn_local_obj(
-        &mut self,
-        future_obj: LocalFutureObj<'static, ()>,
-    ) -> Result<(), SpawnError> {
-        self.push(future_obj);
-        Ok(())
-    }
-}
-*/
-
 // StreamUnordered is implemented using two linked lists. One which links all
 // streams managed by a `StreamUnordered` and one that tracks streams that have
 // been scheduled for polling. The first linked list is not thread safe and is
@@ -115,7 +128,7 @@ impl LocalSpawn for StreamUnordered<LocalFutureObj<'_, ()>> {
 ///
 /// `StreamEntry` allows constructing streams that hold the token that they will be assigned.
 #[derive(Debug)]
-pub struct StreamEntry<'a, S: 'a> {
+pub struct StreamEntry<'a, S> {
     token: usize,
     inserted: bool,
     backref: &'a mut StreamUnordered<S>,
@@ -128,7 +141,9 @@ impl<'a, S: 'a> StreamEntry<'a, S> {
     pub fn insert(mut self, stream: S) {
         self.inserted = true;
 
-        // TODO
+        // this is safe because we've held &mut StreamUnordered the entire time,
+        // so the token still points to a valid task, and no-one else is
+        // touching the .stream of it.
         unsafe {
             (*(*self.backref.by_id[self.token]).stream.get()) = Some(stream);
         }
@@ -217,11 +232,11 @@ impl<S> StreamUnordered<S> {
         self.len == 0 || self.len == TERMINATED_SENTINEL_LENGTH
     }
 
-    /// Returns a handle to a vacant stream slot allowing for further manipulation.
+    /// Returns a handle to a vacant stream entry allowing for further manipulation.
     ///
     /// This function is useful when creating values that must contain their stream token. The
-    /// returned `StreamEntry` reserves a slot for the stream and is able to query the associated
-    /// key.
+    /// returned `StreamEntry` reserves an entry for the stream and is able to query the associated
+    /// token.
     pub fn stream_entry<'a>(&'a mut self) -> StreamEntry<'a, S> {
         let slot = self.by_id.vacant_entry();
         let token = slot.key();
@@ -269,10 +284,11 @@ impl<S> StreamUnordered<S> {
     /// caller must ensure that [`StreamUnordered::poll_next`](Stream::poll_next) is called
     /// in order to receive wake-up notifications for the given stream.
     ///
-    /// The returned token is an identifier that uniquely identifies the given stream. To get a
-    /// handle to the pushed stream, pass the token to [`StreamUnordered::get`] or
-    /// [`StreamUnordered::get_mut`] (or just index `StreamUnordered` directly). The same token
-    /// will be yielded whenever an element is pulled from this stream.
+    /// The returned token is an identifier that uniquely identifies the given stream in the
+    /// current set. To get a handle to the pushed stream, pass the token to
+    /// [`StreamUnordered::get`], [`StreamUnordered::get_mut`], or [`StreamUnordered::get_pin_mut`]
+    /// (or just index `StreamUnordered` directly). The same token will be yielded whenever an
+    /// element is pulled from this stream.
     pub fn push(&mut self, stream: S) -> usize {
         let s = self.stream_entry();
         let token = s.token();
