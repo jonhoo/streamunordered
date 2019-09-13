@@ -1,18 +1,16 @@
-extern crate async_bincode;
-extern crate bincode;
-extern crate futures;
-extern crate streamunordered;
-extern crate tokio;
-
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::SocketAddr;
-
 use async_bincode::*;
+use futures_core::Stream;
+use futures_sink::Sink;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use streamunordered::*;
 use tokio::prelude::*;
 
-struct Echoer {
-    incoming: tokio::net::Incoming,
+struct Echoer<S> {
+    incoming: S,
     inputs: StreamUnordered<
         AsyncBincodeStream<tokio::net::TcpStream, String, String, AsyncDestination>,
     >,
@@ -20,54 +18,56 @@ struct Echoer {
     pending: HashSet<usize>,
 }
 
-impl Echoer {
-    pub fn new(on: tokio::net::TcpListener) -> Self {
+impl<S> Echoer<S>
+where
+    S: Stream<Item = io::Result<tokio::net::TcpStream>> + Unpin,
+{
+    pub fn new(on: S) -> Self {
         Echoer {
-            incoming: on.incoming(),
+            incoming: on,
             inputs: Default::default(),
             out: Default::default(),
             pending: Default::default(),
         }
     }
 
-    fn try_new(&mut self) -> bincode::Result<()> {
-        'more: while let Async::Ready(Some(stream)) = self.incoming.poll()? {
-            let slot = self.inputs.stream_slot();
+    fn try_new(&mut self, cx: &mut Context<'_>) -> bincode::Result<()> {
+        while let Poll::Ready(Some(stream)) = Pin::new(&mut self.incoming).poll_next(cx)? {
+            let slot = self.inputs.stream_entry();
             let tcp = AsyncBincodeStream::from(stream).for_async();
             slot.insert(tcp);
         }
         Ok(())
     }
 
-    fn try_flush(&mut self) -> bincode::Result<()> {
+    fn try_flush(&mut self, cx: &mut Context<'_>) -> bincode::Result<()> {
         // start sending new things
         for (&stream, out) in &mut self.out {
             let s = &mut self.inputs[stream];
-            while let Some(x) = out.pop_front() {
-                match s.start_send(x)? {
-                    AsyncSink::Ready => {
-                        self.pending.insert(stream);
-                    }
-                    AsyncSink::NotReady(x) => {
-                        out.push_front(x);
-                        break;
-                    }
+            let mut s = Pin::new(s);
+            while !out.is_empty() {
+                if let Poll::Pending = s.as_mut().poll_ready(cx)? {
+                    break;
                 }
+
+                s.as_mut().start_send(out.pop_front().expect("!is_empty"))?;
+                self.pending.insert(stream);
             }
         }
 
         // poll things that are pending
         let mut err = Vec::new();
         let inputs = &mut self.inputs;
-        self.pending
-            .retain(|&stream| match inputs[stream].poll_complete() {
-                Ok(Async::Ready(())) => false,
-                Ok(Async::NotReady) => true,
-                Err(e) => {
+        self.pending.retain(
+            |&stream| match Pin::new(&mut inputs[stream]).poll_flush(cx) {
+                Poll::Ready(Ok(())) => false,
+                Poll::Pending => true,
+                Poll::Ready(Err(e)) => {
                     err.push(e);
                     false
                 }
-            });
+            },
+        );
 
         if !err.is_empty() {
             Err(err.swap_remove(0))
@@ -77,98 +77,65 @@ impl Echoer {
     }
 }
 
-impl Future for Echoer {
-    type Item = ();
-    type Error = ();
-    fn poll(&mut self) -> Result<Async<Self::Item>, Self::Error> {
-        let res = (|| -> Result<Async<Self::Item>, bincode::Error> {
-            // see if there are any new connections
-            self.try_new()?;
+impl<S> Future for Echoer<S>
+where
+    S: Stream<Item = io::Result<tokio::net::TcpStream>> + Unpin,
+{
+    type Output = ();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // see if there are any new connections
+        self.try_new(cx).unwrap();
 
-            // see if there's new input for us
-            loop {
-                match self.inputs.poll()? {
-                    Async::Ready(Some((StreamYield::Item(packet), sender))) => {
-                        self.out
-                            .entry(sender)
-                            .or_insert_with(VecDeque::new)
-                            .push_back(packet);
-                    }
-                    Async::Ready(Some((StreamYield::Finished(..), _))) => continue,
-                    Async::Ready(None) => {
-                        // no connections yet
-                        break;
-                    }
-                    Async::NotReady => break,
+        // see if there's new input for us
+        loop {
+            match Pin::new(&mut self.inputs).poll_next(cx) {
+                Poll::Ready(Some((StreamYield::Item(packet), sender))) => {
+                    self.out
+                        .entry(sender)
+                        .or_insert_with(VecDeque::new)
+                        .push_back(packet.unwrap());
                 }
+                Poll::Ready(Some((StreamYield::Finished, _))) => continue,
+                Poll::Ready(None) => {
+                    // no connections yet
+                    break;
+                }
+                Poll::Pending => break,
             }
+        }
 
-            // send stuff that needs to be sent
-            self.try_flush()?;
+        // send stuff that needs to be sent
+        self.try_flush(cx).unwrap();
 
-            Ok(Async::NotReady)
-        })();
-
-        res.map_err(|_| ())
+        Poll::Pending
     }
 }
 
-#[test]
-fn oneshot() {
-    let mut rt = tokio::runtime::Runtime::new().unwrap();
-
-    let on =
-        tokio::net::TcpListener::bind(&SocketAddr::new("127.0.0.1".parse().unwrap(), 0)).unwrap();
+#[tokio::test]
+async fn oneshot() {
+    let on = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = on.local_addr().unwrap();
-    rt.spawn(Echoer::new(on));
+    tokio::spawn(Echoer::new(on.incoming()));
 
-    let ping = tokio::net::TcpStream::connect(&addr)
-        .map(AsyncBincodeStream::from)
-        .map(AsyncBincodeStream::for_async)
-        .map_err(|e| panic!("{:?}", e))
-        .and_then(|s| s.send(String::from("hello world")))
-        .map_err(|e| panic!("{:?}", e))
-        .and_then(|s| s.into_future())
-        .map_err(|e| panic!("{:?}", e))
-        .map(|(r, s)| {
-            assert_eq!(r, Some(String::from("hello world")));
-            s
-        })
-        .map(|_| ());
-
-    ping.wait().unwrap();
+    let s = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut s = AsyncBincodeStream::from(s).for_async();
+    s.send(String::from("hello world")).await.unwrap();
+    let r: String = s.next().await.unwrap().unwrap();
+    assert_eq!(r, String::from("hello world"));
 }
 
-#[test]
-fn twoshot() {
-    let mut rt = tokio::runtime::Runtime::new().unwrap();
-
-    let on =
-        tokio::net::TcpListener::bind(&SocketAddr::new("127.0.0.1".parse().unwrap(), 0)).unwrap();
+#[tokio::test]
+async fn twoshot() {
+    let on = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = on.local_addr().unwrap();
-    rt.spawn(Echoer::new(on));
+    tokio::spawn(Echoer::new(on.incoming()));
 
-    let ping = tokio::net::TcpStream::connect(&addr)
-        .map(AsyncBincodeStream::from)
-        .map(AsyncBincodeStream::for_async)
-        .map_err(|e| panic!("{:?}", e))
-        .and_then(|s| s.send(String::from("hello world")))
-        .map_err(|e| panic!("{:?}", e))
-        .and_then(|s| s.into_future())
-        .map_err(|e| panic!("{:?}", e))
-        .map(|(r, s)| {
-            assert_eq!(r, Some(String::from("hello world")));
-            s
-        })
-        .and_then(|s| s.send(String::from("goodbye world")))
-        .map_err(|e| panic!("{:?}", e))
-        .and_then(|s| s.into_future())
-        .map_err(|e| panic!("{:?}", e))
-        .map(|(r, s)| {
-            assert_eq!(r, Some(String::from("goodbye world")));
-            s
-        })
-        .map(|_| ());
-
-    ping.wait().unwrap();
+    let s = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut s = AsyncBincodeStream::from(s).for_async();
+    s.send(String::from("hello world")).await.unwrap();
+    let r: String = s.next().await.unwrap().unwrap();
+    assert_eq!(r, String::from("hello world"));
+    s.send(String::from("goodbye world")).await.unwrap();
+    let r = s.next().await.unwrap().unwrap();
+    assert_eq!(r, String::from("goodbye world"));
 }

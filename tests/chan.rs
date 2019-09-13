@@ -1,30 +1,28 @@
-extern crate async_bincode;
-extern crate bincode;
-extern crate futures;
-extern crate streamunordered;
-extern crate tokio;
-
+use futures_core::Stream;
+use futures_sink::Sink;
 use std::collections::{HashMap, HashSet, VecDeque};
-
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use streamunordered::*;
 use tokio::prelude::*;
 
 struct Echoer {
-    incoming: futures::sync::mpsc::Receiver<(
-        futures::sync::mpsc::Receiver<String>,
-        futures::sync::mpsc::Sender<String>,
+    incoming: tokio::sync::mpsc::Receiver<(
+        tokio::sync::mpsc::Receiver<String>,
+        tokio::sync::mpsc::Sender<String>,
     )>,
-    inputs: StreamUnordered<futures::sync::mpsc::Receiver<String>>,
-    outputs: HashMap<usize, futures::sync::mpsc::Sender<String>>,
+    inputs: StreamUnordered<tokio::sync::mpsc::Receiver<String>>,
+    outputs: HashMap<usize, tokio::sync::mpsc::Sender<String>>,
     out: HashMap<usize, VecDeque<String>>,
     pending: HashSet<usize>,
 }
 
 impl Echoer {
     pub fn new(
-        on: futures::sync::mpsc::Receiver<(
-            futures::sync::mpsc::Receiver<String>,
-            futures::sync::mpsc::Sender<String>,
+        on: tokio::sync::mpsc::Receiver<(
+            tokio::sync::mpsc::Receiver<String>,
+            tokio::sync::mpsc::Sender<String>,
         )>,
     ) -> Self {
         Echoer {
@@ -36,45 +34,46 @@ impl Echoer {
         }
     }
 
-    fn try_new(&mut self) -> Result<(), ()> {
-        'more: while let Async::Ready(Some((rx, tx))) = self.incoming.poll()? {
-            let slot = self.inputs.stream_slot();
+    fn try_new(&mut self, cx: &mut Context<'_>) -> Result<(), ()> {
+        while let Poll::Ready(Some((rx, tx))) = Pin::new(&mut self.incoming).poll_next(cx) {
+            let slot = self.inputs.stream_entry();
             self.outputs.insert(slot.token(), tx);
             slot.insert(rx);
         }
         Ok(())
     }
 
-    fn try_flush(&mut self) -> Result<(), futures::sync::mpsc::SendError<String>> {
+    fn try_flush(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Result<(), tokio::sync::mpsc::error::SendError> {
         // start sending new things
         for (&stream, out) in &mut self.out {
             let s = self.outputs.get_mut(&stream).unwrap();
-            while let Some(x) = out.pop_front() {
-                match s.start_send(x)? {
-                    AsyncSink::Ready => {
-                        self.pending.insert(stream);
-                    }
-                    AsyncSink::NotReady(x) => {
-                        out.push_front(x);
-                        break;
-                    }
+            let mut s = Pin::new(s);
+            while !out.is_empty() {
+                if let Poll::Pending = s.as_mut().poll_ready(cx)? {
+                    break;
                 }
+
+                s.as_mut().start_send(out.pop_front().expect("!is_empty"))?;
+                self.pending.insert(stream);
             }
         }
 
         // poll things that are pending
         let mut err = Vec::new();
         let outputs = &mut self.outputs;
-        self.pending.retain(
-            |stream| match outputs.get_mut(stream).unwrap().poll_complete() {
-                Ok(Async::Ready(())) => false,
-                Ok(Async::NotReady) => true,
-                Err(e) => {
+        self.pending.retain(|stream| {
+            match Pin::new(outputs.get_mut(stream).unwrap()).poll_flush(cx) {
+                Poll::Ready(Ok(())) => false,
+                Poll::Pending => true,
+                Poll::Ready(Err(e)) => {
                     err.push(e);
                     false
                 }
-            },
-        );
+            }
+        });
 
         if !err.is_empty() {
             Err(err.swap_remove(0))
@@ -85,94 +84,58 @@ impl Echoer {
 }
 
 impl Future for Echoer {
-    type Item = ();
-    type Error = ();
-    fn poll(&mut self) -> Result<Async<Self::Item>, Self::Error> {
+    type Output = ();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // see if there are any new connections
-        self.try_new().unwrap();
+        self.try_new(cx).unwrap();
 
         // see if there's new input for us
         loop {
-            match self.inputs.poll().unwrap() {
-                Async::Ready(Some((StreamYield::Item(packet), sender))) => {
+            match Pin::new(&mut self.inputs).poll_next(cx) {
+                Poll::Ready(Some((StreamYield::Item(packet), sender))) => {
                     self.out
                         .entry(sender)
                         .or_insert_with(VecDeque::new)
                         .push_back(packet);
                 }
-                Async::Ready(Some((StreamYield::Finished(..), _))) => continue,
-                Async::Ready(None) => {
-                    // no connections yet
-                    break;
-                }
-                Async::NotReady => break,
+                Poll::Ready(Some((StreamYield::Finished, _))) => continue,
+                Poll::Ready(None) => unreachable!(),
+                Poll::Pending => break,
             }
         }
 
         // send stuff that needs to be sent
-        self.try_flush().unwrap();
+        self.try_flush(cx).unwrap();
 
-        Ok(Async::NotReady)
+        Poll::Pending
     }
 }
 
-#[test]
-fn oneshot() {
-    let mut rt = tokio::runtime::Runtime::new().unwrap();
+#[tokio::test]
+async fn oneshot() {
+    let (mut mk_tx, mk_rx) = tokio::sync::mpsc::channel(1024);
+    tokio::spawn(Echoer::new(mk_rx));
 
-    let (mk_tx, mk_rx) = futures::sync::mpsc::channel(1024);
-    rt.spawn(Echoer::new(mk_rx));
-
-    let (tx, remote_rx) = futures::sync::mpsc::channel(1024);
-    let (remote_tx, rx) = futures::sync::mpsc::channel(1024);
-    let ping = mk_tx
-        .send((remote_rx, remote_tx))
-        .map_err(|e| panic!("{:?}", e))
-        .and_then(move |_| tx.send(String::from("hello world")))
-        .map_err(|e| panic!("{:?}", e))
-        .and_then(move |tx| rx.into_future().map(|(r, rx)| (r, rx, tx)))
-        .map_err(|e| panic!("{:?}", e))
-        .map(|(r, rx, tx)| {
-            assert_eq!(r, Some(String::from("hello world")));
-            (rx, tx)
-        })
-        .map(|_| ());
-
-    ping.wait().unwrap();
+    let (mut tx, remote_rx) = tokio::sync::mpsc::channel(1024);
+    let (remote_tx, mut rx) = tokio::sync::mpsc::channel(1024);
+    mk_tx.send((remote_rx, remote_tx)).await.unwrap();
+    tx.send(String::from("hello world")).await.unwrap();
+    let r = rx.next().await.unwrap();
+    assert_eq!(r, String::from("hello world"));
 }
 
-#[test]
-fn twoshot() {
-    let mut rt = tokio::runtime::Runtime::new().unwrap();
+#[tokio::test]
+async fn twoshot() {
+    let (mut mk_tx, mk_rx) = tokio::sync::mpsc::channel(1024);
+    tokio::spawn(Echoer::new(mk_rx));
 
-    let (mk_tx, mk_rx) = futures::sync::mpsc::channel(1024);
-    rt.spawn(Echoer::new(mk_rx));
-
-    let (tx, remote_rx) = futures::sync::mpsc::channel(1024);
-    let (remote_tx, rx) = futures::sync::mpsc::channel(1024);
-    let ping = mk_tx
-        .send((remote_rx, remote_tx))
-        .map_err(|e| panic!("{:?}", e))
-        .and_then(move |_| tx.send(String::from("hello world")))
-        .map_err(|e| panic!("{:?}", e))
-        .and_then(move |tx| rx.into_future().map(|(r, rx)| (r, rx, tx)))
-        .map_err(|e| panic!("{:?}", e))
-        .map(|(r, rx, tx)| {
-            assert_eq!(r, Some(String::from("hello world")));
-            (rx, tx)
-        })
-        .and_then(|(rx, tx)| {
-            tx.send(String::from("goodbye world"))
-                .map(move |tx| (rx, tx))
-        })
-        .map_err(|e| panic!("{:?}", e))
-        .and_then(|(rx, tx)| rx.into_future().map(move |(r, rx)| (r, rx, tx)))
-        .map_err(|e| panic!("{:?}", e))
-        .map(|(r, rx, tx)| {
-            assert_eq!(r, Some(String::from("goodbye world")));
-            (rx, tx)
-        })
-        .map(|_| ());
-
-    ping.wait().unwrap();
+    let (mut tx, remote_rx) = tokio::sync::mpsc::channel(1024);
+    let (remote_tx, mut rx) = tokio::sync::mpsc::channel(1024);
+    mk_tx.send((remote_rx, remote_tx)).await.unwrap();
+    tx.send(String::from("hello world")).await.unwrap();
+    let r = rx.next().await.unwrap();
+    assert_eq!(r, String::from("hello world"));
+    tx.send(String::from("goodbye world")).await.unwrap();
+    let r = rx.next().await.unwrap();
+    assert_eq!(r, String::from("goodbye world"));
 }
