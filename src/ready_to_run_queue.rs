@@ -8,27 +8,27 @@ use futures_util::task::AtomicWaker;
 use super::abort::abort;
 use super::task::Task;
 
-pub(super) enum Dequeue<Fut> {
-    Data(*const Task<Fut>),
+pub(super) enum Dequeue<S> {
+    Data(*const Task<S>),
     Empty,
     Inconsistent,
 }
 
-pub(super) struct ReadyToRunQueue<Fut> {
-    // The waker of the task using `FuturesUnordered`.
+pub(super) struct ReadyToRunQueue<S> {
+    // The waker of the task using `StreamUnordered`.
     pub(super) waker: AtomicWaker,
 
     // Head/tail of the readiness queue
-    pub(super) head: AtomicPtr<Task<Fut>>,
-    pub(super) tail: UnsafeCell<*const Task<Fut>>,
-    pub(super) stub: Arc<Task<Fut>>,
+    pub(super) head: AtomicPtr<Task<S>>,
+    pub(super) tail: UnsafeCell<*const Task<S>>,
+    pub(super) stub: Arc<Task<S>>,
 }
 
-/// An MPSC queue into which the tasks containing the futures are inserted
-/// whenever the future inside is scheduled for polling.
-impl<Fut> ReadyToRunQueue<Fut> {
+/// An MPSC queue into which the tasks containing the streams are inserted
+/// whenever the stream inside is scheduled for polling.
+impl<S> ReadyToRunQueue<S> {
     /// The enqueue function from the 1024cores intrusive MPSC queue algorithm.
-    pub(super) fn enqueue(&self, task: *const Task<Fut>) {
+    pub(super) fn enqueue(&self, task: *const Task<S>) {
         unsafe {
             debug_assert!((*task).queued.load(Relaxed));
 
@@ -46,7 +46,7 @@ impl<Fut> ReadyToRunQueue<Fut> {
     ///
     /// Note that this is unsafe as it required mutual exclusion (only one
     /// thread can call this) to be guaranteed elsewhere.
-    pub(super) unsafe fn dequeue(&self) -> Dequeue<Fut> {
+    pub(super) unsafe fn dequeue(&self) -> Dequeue<S> {
         let mut tail = *self.tail.get();
         let mut next = (*tail).next_ready_to_run.load(Acquire);
 
@@ -82,19 +82,19 @@ impl<Fut> ReadyToRunQueue<Fut> {
         Dequeue::Inconsistent
     }
 
-    pub(super) fn stub(&self) -> *const Task<Fut> {
+    pub(super) fn stub(&self) -> *const Task<S> {
         &*self.stub
     }
 }
 
-impl<Fut> Drop for ReadyToRunQueue<Fut> {
+impl<S> Drop for ReadyToRunQueue<S> {
     fn drop(&mut self) {
-        // Once we're in the destructor for `Inner<Fut>` we need to clear out
+        // Once we're in the destructor for `Inner<S>` we need to clear out
         // the ready to run queue of tasks if there's anything left in there.
         //
         // Note that each task has a strong reference count associated with it
         // which is owned by the ready to run queue. All tasks should have had
-        // their futures dropped already by the `FuturesUnordered` destructor
+        // their streams dropped already by the `StreamUnordered` destructor
         // above, so we're just pulling out tasks and dropping their refcounts.
         unsafe {
             loop {

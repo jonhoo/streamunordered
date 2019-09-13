@@ -1,21 +1,11 @@
-use futures_core::{ready, Stream};
+use futures_core::Stream;
 use futures_sink::Sink;
-use futures_util::stream::StreamExt;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use streamunordered::*;
 use tokio::prelude::*;
-
-async fn echoer<I, RX, TX>(on: I)
-where
-    I: Stream<Item = (RX, TX)>,
-    RX: Stream<String>,
-    TX: Stream<String>,
-{
-    select
-}
 
 struct Echoer {
     incoming: tokio::sync::mpsc::Receiver<(
@@ -46,7 +36,7 @@ impl Echoer {
 
     fn try_new(&mut self, cx: &mut Context<'_>) -> Result<(), ()> {
         while let Poll::Ready(Some((rx, tx))) = Pin::new(&mut self.incoming).poll_next(cx) {
-            let slot = self.inputs.stream_slot();
+            let slot = self.inputs.stream_entry();
             self.outputs.insert(slot.token(), tx);
             slot.insert(rx);
         }
