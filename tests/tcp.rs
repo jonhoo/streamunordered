@@ -95,7 +95,10 @@ where
                         .or_insert_with(VecDeque::new)
                         .push_back(packet.unwrap());
                 }
-                Poll::Ready(Some((StreamYield::Finished, _))) => continue,
+                Poll::Ready(Some((StreamYield::Finished(f), _))) => {
+                    f.keep();
+                    continue;
+                }
                 Poll::Ready(None) => {
                     // no connections yet
                     break;
@@ -138,4 +141,19 @@ async fn twoshot() {
     s.send(String::from("goodbye world")).await.unwrap();
     let r = s.next().await.unwrap().unwrap();
     assert_eq!(r, String::from("goodbye world"));
+}
+
+#[tokio::test]
+async fn close_early() {
+    let on = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = on.local_addr().unwrap();
+    tokio::spawn(Echoer::new(on.incoming()));
+
+    let s = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut s = AsyncBincodeStream::from(s).for_async();
+    let (mut r, mut w) = s.tcp_split();
+    w.send(String::from("hello world")).await.unwrap();
+    w.close().await.unwrap();
+    let r: String = r.next().await.unwrap().unwrap();
+    assert_eq!(r, String::from("hello world"));
 }

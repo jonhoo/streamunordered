@@ -11,6 +11,9 @@ pub(super) struct Task<S> {
     // The stream
     pub(super) stream: UnsafeCell<Option<S>>,
 
+    // Indicator that the stream has already completed.
+    pub(super) is_done: UnsafeCell<bool>,
+
     // Next pointer for linked list tracking all active tasks
     pub(super) next_all: UnsafeCell<*const Task<S>>,
 

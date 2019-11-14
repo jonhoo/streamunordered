@@ -98,7 +98,10 @@ impl Future for Echoer {
                         .or_insert_with(VecDeque::new)
                         .push_back(packet);
                 }
-                Poll::Ready(Some((StreamYield::Finished, _))) => continue,
+                Poll::Ready(Some((StreamYield::Finished(f), _))) => {
+                    f.remove(Pin::new(&mut self.inputs));
+                    continue;
+                }
                 Poll::Ready(None) => unreachable!(),
                 Poll::Pending => break,
             }

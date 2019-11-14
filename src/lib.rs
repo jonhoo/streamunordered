@@ -182,6 +182,7 @@ impl<S: Stream> StreamUnordered<S> {
         let slot = slab.vacant_entry();
         let stub = Arc::new(Task {
             stream: UnsafeCell::new(None),
+            is_done: UnsafeCell::new(false),
             next_all: UnsafeCell::new(ptr::null()),
             prev_all: UnsafeCell::new(ptr::null()),
             next_ready_to_run: AtomicPtr::new(ptr::null_mut()),
@@ -243,6 +244,7 @@ impl<S> StreamUnordered<S> {
 
         let task = Arc::new(Task {
             stream: UnsafeCell::new(None),
+            is_done: UnsafeCell::new(false),
             next_all: UnsafeCell::new(ptr::null_mut()),
             prev_all: UnsafeCell::new(ptr::null_mut()),
             next_ready_to_run: AtomicPtr::new(ptr::null_mut()),
@@ -294,6 +296,66 @@ impl<S> StreamUnordered<S> {
         let token = s.token();
         s.insert(stream);
         token
+    }
+
+    /// Remove a stream from the set.
+    ///
+    /// The stream will be dropped and will no longer yield stream events.
+    pub fn remove(mut self: Pin<&mut Self>, token: usize) -> bool {
+        if token == 0 {
+            return false;
+        }
+
+        let task = if let Some(task) = self.by_id.get(token) {
+            *task
+        } else {
+            return false;
+        };
+
+        // we know that by_id only references valid tasks
+        let task = unsafe { self.unlink(task) };
+        self.release_task(task);
+        true
+    }
+
+    /// Remove and return a stream from the set.
+    ///
+    /// The stream will no longer be polled, and will no longer yield stream events.
+    ///
+    /// Note that since this method moves `S`, which we may have given out a `Pin` to, it requires
+    /// that `S` is `Unpin`.
+    pub fn take(mut self: Pin<&mut Self>, token: usize) -> Option<S>
+    where
+        S: Unpin,
+    {
+        if token == 0 {
+            return None;
+        }
+
+        let task = *self.by_id.get(token)?;
+
+        // we know that by_id only references valid tasks
+        let task = unsafe { self.unlink(task) };
+
+        // This is safe because we're dropping the stream on the thread that owns
+        // `StreamUnordered`, which correctly tracks `S`'s lifetimes and such.
+        // The logic is the same as for why release_task is allowed to touch task.stream.
+        // Since S: Unpin, it is okay for us to move S.
+        let stream = unsafe { &mut *task.stream.get() }.take();
+
+        self.release_task(task);
+
+        stream
+    }
+
+    /// Returns `true` if the stream with the given token has yielded `None`.
+    pub fn is_finished(&self, token: usize) -> Option<bool> {
+        if token == 0 {
+            return None;
+        }
+
+        // we know that by_id only references valid tasks
+        Some(unsafe { (*(**self.by_id.get(token)?).is_done.get()) })
     }
 
     /// Returns a reference to the stream with the given token
@@ -467,7 +529,55 @@ where
     /// The underlying stream produced an item.
     Item(S::Item),
     /// The underlying stream has completed.
-    Finished,
+    Finished(FinishedStream),
+}
+
+/// A stream that has yielded all the items it ever will.
+///
+/// The underlying stream will only be dropped by explicitly removing it from the associated
+/// `StreamUnordered`. This method is marked as `#[must_use]` to ensure that you either remove the
+/// stream immediately, or you explicitly ask for it to be kept around for later use.
+///
+/// If the `FinishedStream` is dropped, the exhausted stream will not be dropped until the owning
+/// `StreamUnordered` is.
+#[must_use]
+pub struct FinishedStream {
+    token: usize,
+}
+
+impl FinishedStream {
+    /// Remove the exhausted stream.
+    ///
+    /// See [`StreamUnordered::remove`].
+    pub fn remove<S>(self, so: Pin<&mut StreamUnordered<S>>) {
+        so.remove(self.token);
+    }
+
+    /// Take the exhausted stream.
+    ///
+    /// Note that this requires `S: Unpin` since it moves the stream even though it has already
+    /// been pinned by `StreamUnordered`.
+    ///
+    /// See [`StreamUnordered::take`].
+    pub fn take<S>(self, so: Pin<&mut StreamUnordered<S>>) -> Option<S>
+    where
+        S: Unpin,
+    {
+        so.take(self.token)
+    }
+
+    /// Leave the exhausted stream in the `StreamUnordered`.
+    ///
+    /// This allows you to continue to access the stream through [`StreamUnordered::get_mut`] and
+    /// friends should you need to perform further operations on it (e.g., if it is also being used
+    /// as a `Sink`). Note that the stream will then not be dropped until you explicitly `remove`
+    /// or `take` it from the `StreamUnordered`.
+    pub fn keep(self) {}
+
+    /// Return the token associated with the exhausted stream.
+    pub fn token(self) -> usize {
+        self.token
+    }
 }
 
 impl<S> Debug for StreamYield<S>
@@ -478,7 +588,7 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             StreamYield::Item(ref i) => f.debug_tuple("StreamYield::Item").field(i).finish(),
-            StreamYield::Finished => f.debug_tuple("StreamYield::Finished").finish(),
+            StreamYield::Finished(_) => f.debug_tuple("StreamYield::Finished").finish(),
         }
     }
 }
@@ -559,6 +669,14 @@ impl<S: Stream> Stream for StreamUnordered<S> {
                 }
             };
 
+            // Safety: we only ever access is_done on the thread that owns StreamUnordered.
+            if unsafe { *(*task).is_done.get() } {
+                // This stream has already been polled to completion.
+                // We're keeping it around because the user has not removed it yet.
+                // We can ignore any wake-ups for the Stream.
+                continue;
+            }
+
             // Safety: `task` is a valid pointer
             let task = unsafe { self.unlink(task) };
 
@@ -629,10 +747,23 @@ impl<S: Stream> Stream for StreamUnordered<S> {
                     continue;
                 }
                 Poll::Ready(None) => {
-                    // The stream has completed and should be removed.
-                    // Dropping the bomb will do that.
-                    // NOTE: it'd be nice if we could yield the stream itself if Unpin here
-                    return Poll::Ready(Some((StreamYield::Finished, id)));
+                    // The stream has completed -- let the user know.
+                    // Note that we do not remove the stream here. Instead, we let the user decide
+                    // whether to keep the stream for a bit longer, in case they still need to do
+                    // some work with it (like if it's also a Sink and they need to flush some more
+                    // stuff).
+
+                    // Safe as we only ever access is_done on the thread that owns StreamUnordered.
+                    let task = bomb.task.take().unwrap();
+                    unsafe {
+                        *task.is_done.get() = true;
+                    }
+                    bomb.queue.link(task);
+
+                    return Poll::Ready(Some((
+                        StreamYield::Finished(FinishedStream { token: id }),
+                        id,
+                    )));
                 }
                 Poll::Ready(Some(output)) => {
                     // We're not done with the stream just because it yielded something
