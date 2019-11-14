@@ -60,7 +60,13 @@ where
         let inputs = &mut self.inputs;
         self.pending.retain(
             |&stream| match Pin::new(&mut inputs[stream]).poll_flush(cx) {
-                Poll::Ready(Ok(())) => false,
+                Poll::Ready(Ok(())) => {
+                    if inputs.is_finished(stream).unwrap_or(false) {
+                        // _now_ we can drop the stream
+                        Pin::new(&mut *inputs).remove(stream);
+                    }
+                    false
+                }
                 Poll::Pending => true,
                 Poll::Ready(Err(e)) => {
                     err.push(e);
