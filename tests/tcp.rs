@@ -1,16 +1,13 @@
 use async_bincode::*;
-use futures_core::Stream;
-use futures_sink::Sink;
+use futures::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
-use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use streamunordered::*;
-use tokio::prelude::*;
 
-struct Echoer<S> {
-    incoming: S,
+struct Echoer {
+    incoming: tokio::net::TcpListener,
     inputs: StreamUnordered<
         AsyncBincodeStream<tokio::net::TcpStream, String, String, AsyncDestination>,
     >,
@@ -18,11 +15,8 @@ struct Echoer<S> {
     pending: HashSet<usize>,
 }
 
-impl<S> Echoer<S>
-where
-    S: Stream<Item = io::Result<tokio::net::TcpStream>> + Unpin,
-{
-    pub fn new(on: S) -> Self {
+impl Echoer {
+    pub fn new(on: tokio::net::TcpListener) -> Self {
         Echoer {
             incoming: on,
             inputs: Default::default(),
@@ -32,7 +26,9 @@ where
     }
 
     fn try_new(&mut self, cx: &mut Context<'_>) -> bincode::Result<()> {
-        while let Poll::Ready(Some(stream)) = Pin::new(&mut self.incoming).poll_next(cx)? {
+        while let Poll::Ready(Some(stream)) =
+            Pin::new(&mut self.incoming.incoming()).poll_next(cx)?
+        {
             let slot = self.inputs.stream_entry();
             let tcp = AsyncBincodeStream::from(stream).for_async();
             slot.insert(tcp);
@@ -83,10 +79,7 @@ where
     }
 }
 
-impl<S> Future for Echoer<S>
-where
-    S: Stream<Item = io::Result<tokio::net::TcpStream>> + Unpin,
-{
+impl Future for Echoer {
     type Output = ();
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // see if there are any new connections
@@ -124,7 +117,7 @@ where
 async fn oneshot() {
     let on = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = on.local_addr().unwrap();
-    tokio::spawn(Echoer::new(on.incoming()));
+    tokio::spawn(Echoer::new(on));
 
     let s = tokio::net::TcpStream::connect(&addr).await.unwrap();
     let mut s = AsyncBincodeStream::from(s).for_async();
@@ -137,7 +130,7 @@ async fn oneshot() {
 async fn twoshot() {
     let on = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = on.local_addr().unwrap();
-    tokio::spawn(Echoer::new(on.incoming()));
+    tokio::spawn(Echoer::new(on));
 
     let s = tokio::net::TcpStream::connect(&addr).await.unwrap();
     let mut s = AsyncBincodeStream::from(s).for_async();
@@ -153,7 +146,7 @@ async fn twoshot() {
 async fn close_early() {
     let on = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = on.local_addr().unwrap();
-    tokio::spawn(Echoer::new(on.incoming()));
+    tokio::spawn(Echoer::new(on));
 
     let s = tokio::net::TcpStream::connect(&addr).await.unwrap();
     let mut s = AsyncBincodeStream::from(s).for_async();

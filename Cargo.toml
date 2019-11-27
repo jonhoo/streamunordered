@@ -1,6 +1,6 @@
 [package]
 name = "streamunordered"
-version = "0.5.0-alpha.3"
+version = "0.5.0"
 authors = ["Jon Gjengset <jon@thesquareplanet.com>"]
 license = "MIT/Apache-2.0"
 edition = "2018"
@@ -18,12 +18,13 @@ travis-ci = { repository = "jonhoo/streamunordered" }
 maintenance = { status = "passively-maintained" }
 
 [dependencies]
-futures-core-preview = "=0.3.0-alpha.19"
-futures-sink-preview = "=0.3.0-alpha.19"
-futures-util-preview = "=0.3.0-alpha.19"
+futures-core = "0.3.0"
+futures-sink = "0.3.0"
+futures-util = "0.3.0"
 slab = "0.4.0"
 
 [dev-dependencies]
-tokio = "=0.2.0-alpha.6"
-async-bincode = "=0.5.0-alpha.6"
+tokio = { version = "0.2.0", features = ["full"] }
+async-bincode = "0.5.0"
+futures = "0.3.0"
 bincode = "1.0.0"

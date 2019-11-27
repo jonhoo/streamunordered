@@ -1,11 +1,9 @@
-use futures_core::Stream;
-use futures_sink::Sink;
+use futures::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use streamunordered::*;
-use tokio::prelude::*;
 
 struct Echoer {
     incoming: tokio::sync::mpsc::Receiver<(
@@ -43,43 +41,24 @@ impl Echoer {
         Ok(())
     }
 
-    fn try_flush(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Result<(), tokio::sync::mpsc::error::SendError> {
+    fn try_flush(&mut self, cx: &mut Context<'_>) -> Result<(), ()> {
         // start sending new things
         for (&stream, out) in &mut self.out {
             let s = self.outputs.get_mut(&stream).unwrap();
-            let mut s = Pin::new(s);
             while !out.is_empty() {
-                if let Poll::Pending = s.as_mut().poll_ready(cx)? {
+                if let Poll::Pending = s.poll_ready(cx).map_err(|_| ())? {
                     break;
                 }
 
-                s.as_mut().start_send(out.pop_front().expect("!is_empty"))?;
+                s.try_send(out.pop_front().expect("!is_empty"))
+                    .map_err(|_| ())?;
                 self.pending.insert(stream);
             }
         }
 
-        // poll things that are pending
-        let mut err = Vec::new();
-        let outputs = &mut self.outputs;
-        self.pending.retain(|stream| {
-            match Pin::new(outputs.get_mut(stream).unwrap()).poll_flush(cx) {
-                Poll::Ready(Ok(())) => false,
-                Poll::Pending => true,
-                Poll::Ready(Err(e)) => {
-                    err.push(e);
-                    false
-                }
-            }
-        });
+        // NOTE: no need to flush channels
 
-        if !err.is_empty() {
-            Err(err.swap_remove(0))
-        } else {
-            Ok(())
-        }
+        Ok(())
     }
 }
 
