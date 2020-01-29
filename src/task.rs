@@ -1,6 +1,6 @@
 use alloc::sync::{Arc, Weak};
 use core::cell::UnsafeCell;
-use core::sync::atomic::Ordering::SeqCst;
+use core::sync::atomic::Ordering::{self, SeqCst};
 use core::sync::atomic::{AtomicBool, AtomicPtr};
 
 use super::abort::abort;
@@ -14,11 +14,17 @@ pub(super) struct Task<S> {
     // Indicator that the stream has already completed.
     pub(super) is_done: UnsafeCell<bool>,
 
-    // Next pointer for linked list tracking all active tasks
-    pub(super) next_all: UnsafeCell<*const Task<S>>,
+    // Next pointer for linked list tracking all active tasks (use
+    // `spin_next_all` to read when access is shared across threads)
+    pub(super) next_all: AtomicPtr<Task<S>>,
 
     // Previous task in linked list tracking all active tasks
     pub(super) prev_all: UnsafeCell<*const Task<S>>,
+
+    // Length of the linked list tracking all active tasks when this node was
+    // inserted (use `spin_next_all` to synchronize before reading when access
+    // is shared across threads)
+    pub(super) len_all: UnsafeCell<usize>,
 
     // Next pointer in ready to run queue
     pub(super) next_ready_to_run: AtomicPtr<Task<S>>,
@@ -72,6 +78,30 @@ impl<S> Task<S> {
     /// Returns a waker reference for this task without cloning the Arc.
     pub(super) fn waker_ref<'a>(this: &'a Arc<Task<S>>) -> WakerRef<'a> {
         waker_ref(this)
+    }
+
+    /// Spins until `next_all` is no longer set to `pending_next_all`.
+    ///
+    /// The temporary `pending_next_all` value is typically overwritten fairly
+    /// quickly after a node is inserted into the list of all streams, so this
+    /// should rarely spin much.
+    ///
+    /// When it returns, the correct `next_all` value is returned.
+    ///
+    /// `Relaxed` or `Acquire` ordering can be used. `Acquire` ordering must be
+    /// used before `len_all` can be safely read.
+    #[inline]
+    pub(super) fn spin_next_all(
+        &self,
+        pending_next_all: *mut Self,
+        ordering: Ordering,
+    ) -> *const Self {
+        loop {
+            let next = self.next_all.load(ordering);
+            if next != pending_next_all {
+                return next;
+            }
+        }
     }
 }
 
