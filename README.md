@@ -16,7 +16,7 @@ required amount of work needed to coordinate large numbers of streams.
 
 When a `StreamUnordered` is first created, it does not contain any streams. Calling `poll` in
 this state will result in `Ok(Async::Ready(None))` to be returned. Streams are submitted to the
-set using `push`; however, the stream will **not** be polled at this point. `StreamUnordered`
+set using `push_front`; however, the stream will **not** be polled at this point. `StreamUnordered`
 will only poll managed streams when `StreamUnordered::poll` is called. As such, it is important
 to call `poll` after pushing new streams.
 
