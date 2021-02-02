@@ -3,16 +3,16 @@
 //! This "combinator" provides the ability to maintain and drive a set of streams to completion,
 //! while also providing access to each stream as it yields new elements.
 //!
-//! Streams are pushed into this set and their realized values are yielded as they are produced.
+//! Streams are inserted into this set and their realized values are yielded as they are produced.
 //! This structure is optimized to manage a large number of streams. Streams managed by
 //! `StreamUnordered` will only be polled when they generate notifications. This reduces the
 //! required amount of work needed to coordinate large numbers of streams.
 //!
 //! When a `StreamUnordered` is first created, it does not contain any streams. Calling `poll` in
 //! this state will result in `Poll::Ready((None)` to be returned. Streams are submitted to the
-//! set using `push`; however, the stream will **not** be polled at this point. `StreamUnordered`
+//! set using `insert`; however, the stream will **not** be polled at this point. `StreamUnordered`
 //! will only poll managed streams when `StreamUnordered::poll` is called. As such, it is important
-//! to call `poll` after pushing new streams.
+//! to call `poll` after inserting new streams.
 //!
 //! If `StreamUnordered::poll` returns `Poll::Ready(None)` this means that the set is
 //! currently not managing any streams. A stream may be submitted to the set at a later time. At
@@ -30,7 +30,7 @@
 //! `StreamYield::Finished`, its token may be reused for new streams that are added.
 
 #![deny(missing_docs)]
-#![warn(rust_2018_idioms)]
+#![warn(rust_2018_idioms, broken_intra_doc_links)]
 
 // This is mainly FuturesUnordered from futures_util, but adapted to operate over Streams rather
 // than Futures.
@@ -89,7 +89,7 @@ const YIELD_EVERY: usize = 32;
 ///
 /// [`StreamUnordered`] can be filled by [`collect`](Iterator::collect)ing an
 /// iterator of streams into a [`StreamUnordered`], or by
-/// [`push`](StreamUnordered::push)ing streams onto an existing
+/// [`insert`](StreamUnordered::insert)ing streams onto an existing
 /// [`StreamUnordered`]. When new streams are added,
 /// [`poll_next`](Stream::poll_next) must be called in order to begin receiving
 /// wake-ups for new streams.
@@ -288,19 +288,30 @@ impl<S> StreamUnordered<S> {
         }
     }
 
-    /// Push a stream into the set.
+    /// Insert a stream into the set.
     ///
-    /// This method adds the given stream to the set. This method will not
-    /// call [`poll_next`](futures_util::stream::Stream::poll_next) on the submitted stream. The caller must
-    /// ensure that [`StreamUnordered::poll_next`](Stream::poll_next) is called
-    /// in order to receive wake-up notifications for the given stream.
+    /// A deprecated synonym for [`insert`].
+    #[deprecated(since = "0.5.2", note = "Prefer StreamUnordered::insert")]
+    pub fn push(&mut self, stream: S) -> usize {
+        self.insert(stream)
+    }
+
+    /// Insert a stream into the set.
+    ///
+    /// This method adds the given stream to the set. This method will not call
+    /// [`poll_next`](futures_util::stream::Stream::poll_next) on the submitted stream. The caller
+    /// must ensure that [`StreamUnordered::poll_next`](Stream::poll_next) is called in order to
+    /// receive wake-up notifications for the given stream.
     ///
     /// The returned token is an identifier that uniquely identifies the given stream in the
-    /// current set. To get a handle to the pushed stream, pass the token to
+    /// current set. To get a handle to the inserted stream, pass the token to
     /// [`StreamUnordered::get`], [`StreamUnordered::get_mut`], or [`StreamUnordered::get_pin_mut`]
     /// (or just index `StreamUnordered` directly). The same token will be yielded whenever an
     /// element is pulled from this stream.
-    pub fn push(&mut self, stream: S) -> usize {
+    ///
+    /// Note that the streams are not ordered, and may not be yielded back in insertion or token
+    /// order when you iterate over them.
+    pub fn insert(&mut self, stream: S) -> usize {
         let s = self.stream_entry();
         let token = s.token();
         s.insert(stream);
@@ -364,7 +375,7 @@ impl<S> StreamUnordered<S> {
         }
 
         // we know that by_id only references valid tasks
-        Some(unsafe { (*(**self.by_id.get(token)?).is_done.get()) })
+        Some(unsafe { *(**self.by_id.get(token)?).is_done.get() })
     }
 
     /// Returns a reference to the stream with the given token
@@ -938,7 +949,7 @@ impl<S: Stream> FromIterator<S> for StreamUnordered<S> {
     {
         let acc = StreamUnordered::new();
         iter.into_iter().fold(acc, |mut acc, item| {
-            acc.push(item);
+            acc.insert(item);
             acc
         })
     }
@@ -962,9 +973,9 @@ mod micro {
         let forever1 = Box::pin(stream::iter(vec![1].into_iter().cycle()));
         let two = Box::pin(stream::iter(vec![2].into_iter()));
         let mut s = StreamUnordered::new();
-        let forever0 = s.push(forever0 as Pin<Box<dyn Stream<Item = i32>>>);
-        let forever1 = s.push(forever1 as Pin<Box<dyn Stream<Item = i32>>>);
-        let two = s.push(two as Pin<Box<dyn Stream<Item = i32>>>);
+        let forever0 = s.insert(forever0 as Pin<Box<dyn Stream<Item = i32>>>);
+        let forever1 = s.insert(forever1 as Pin<Box<dyn Stream<Item = i32>>>);
+        let two = s.insert(two as Pin<Box<dyn Stream<Item = i32>>>);
         let mut rt = tokio::runtime::Builder::new()
             .basic_scheduler()
             .build()
