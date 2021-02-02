@@ -26,9 +26,7 @@ impl Echoer {
     }
 
     fn try_new(&mut self, cx: &mut Context<'_>) -> bincode::Result<()> {
-        while let Poll::Ready(Some(stream)) =
-            Pin::new(&mut self.incoming.incoming()).poll_next(cx)?
-        {
+        while let Poll::Ready((stream, _)) = self.incoming.poll_accept(cx)? {
             let slot = self.inputs.stream_entry();
             let tcp = AsyncBincodeStream::from(stream).for_async();
             slot.insert(tcp);

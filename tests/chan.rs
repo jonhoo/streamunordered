@@ -10,7 +10,7 @@ struct Echoer {
         tokio::sync::mpsc::Receiver<String>,
         tokio::sync::mpsc::Sender<String>,
     )>,
-    inputs: StreamUnordered<tokio::sync::mpsc::Receiver<String>>,
+    inputs: StreamUnordered<tokio_stream::wrappers::ReceiverStream<String>>,
     outputs: HashMap<usize, tokio::sync::mpsc::Sender<String>>,
     out: HashMap<usize, VecDeque<String>>,
     pending: HashSet<usize>,
@@ -33,26 +33,32 @@ impl Echoer {
     }
 
     fn try_new(&mut self, cx: &mut Context<'_>) -> Result<(), ()> {
-        while let Poll::Ready(Some((rx, tx))) = Pin::new(&mut self.incoming).poll_next(cx) {
+        while let Poll::Ready(Some((rx, tx))) = self.incoming.poll_recv(cx) {
             let slot = self.inputs.stream_entry();
             self.outputs.insert(slot.token(), tx);
-            slot.insert(rx);
+            slot.insert(tokio_stream::wrappers::ReceiverStream::new(rx));
         }
         Ok(())
     }
 
-    fn try_flush(&mut self, cx: &mut Context<'_>) -> Result<(), ()> {
+    fn try_flush(&mut self, _: &mut Context<'_>) -> Result<(), ()> {
         // start sending new things
         for (&stream, out) in &mut self.out {
             let s = self.outputs.get_mut(&stream).unwrap();
             while !out.is_empty() {
-                if let Poll::Pending = s.poll_ready(cx).map_err(|_| ())? {
-                    break;
+                use tokio::sync::mpsc::error::TrySendError;
+                match s.try_reserve() {
+                    Err(TrySendError::Full(_)) => {
+                        // NOTE: This is likely wrong -- we need poll_reserve so that we'll be
+                        // woken up again when the channel _does_ have capacity.
+                        break;
+                    }
+                    Err(TrySendError::Closed(_)) => return Err(()),
+                    Ok(p) => {
+                        p.send(out.pop_front().expect("!is_empty"));
+                        self.pending.insert(stream);
+                    }
                 }
-
-                s.try_send(out.pop_front().expect("!is_empty"))
-                    .map_err(|_| ())?;
-                self.pending.insert(stream);
             }
         }
 
@@ -95,29 +101,29 @@ impl Future for Echoer {
 
 #[tokio::test]
 async fn oneshot() {
-    let (mut mk_tx, mk_rx) = tokio::sync::mpsc::channel(1024);
+    let (mk_tx, mk_rx) = tokio::sync::mpsc::channel(1024);
     tokio::spawn(Echoer::new(mk_rx));
 
-    let (mut tx, remote_rx) = tokio::sync::mpsc::channel(1024);
+    let (tx, remote_rx) = tokio::sync::mpsc::channel(1024);
     let (remote_tx, mut rx) = tokio::sync::mpsc::channel(1024);
     mk_tx.send((remote_rx, remote_tx)).await.unwrap();
     tx.send(String::from("hello world")).await.unwrap();
-    let r = rx.next().await.unwrap();
+    let r = rx.recv().await.unwrap();
     assert_eq!(r, String::from("hello world"));
 }
 
 #[tokio::test]
 async fn twoshot() {
-    let (mut mk_tx, mk_rx) = tokio::sync::mpsc::channel(1024);
+    let (mk_tx, mk_rx) = tokio::sync::mpsc::channel(1024);
     tokio::spawn(Echoer::new(mk_rx));
 
-    let (mut tx, remote_rx) = tokio::sync::mpsc::channel(1024);
+    let (tx, remote_rx) = tokio::sync::mpsc::channel(1024);
     let (remote_tx, mut rx) = tokio::sync::mpsc::channel(1024);
     mk_tx.send((remote_rx, remote_tx)).await.unwrap();
     tx.send(String::from("hello world")).await.unwrap();
-    let r = rx.next().await.unwrap();
+    let r = rx.recv().await.unwrap();
     assert_eq!(r, String::from("hello world"));
     tx.send(String::from("goodbye world")).await.unwrap();
-    let r = rx.next().await.unwrap();
+    let r = rx.recv().await.unwrap();
     assert_eq!(r, String::from("goodbye world"));
 }

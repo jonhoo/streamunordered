@@ -976,8 +976,7 @@ mod micro {
         let forever0 = s.insert(forever0 as Pin<Box<dyn Stream<Item = i32>>>);
         let forever1 = s.insert(forever1 as Pin<Box<dyn Stream<Item = i32>>>);
         let two = s.insert(two as Pin<Box<dyn Stream<Item = i32>>>);
-        let mut rt = tokio::runtime::Builder::new()
-            .basic_scheduler()
+        let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
         let mut s = rt.block_on(s.take(100).collect::<Vec<_>>()).into_iter();
