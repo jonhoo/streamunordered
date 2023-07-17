@@ -72,14 +72,15 @@ impl<'a, S: Unpin> Iterator for IterMut<'a, S> {
 impl<S: Unpin> ExactSizeIterator for IterMut<'_, S> {}
 
 impl<'a, S> Iterator for IterPinRef<'a, S> {
-    type Item = Pin<&'a S>;
+    type Item = (usize, Pin<&'a S>);
 
-    fn next(&mut self) -> Option<Pin<&'a S>> {
+    fn next(&mut self) -> Option<(usize, Pin<&'a S>)> {
         if self.task.is_null() {
             return None;
         }
         unsafe {
-            let stream = (*(*self.task).stream.get()).as_ref().unwrap();
+            let task = &*self.task;
+            let stream = (*task.stream.get()).as_ref().unwrap();
 
             // Relaxed ordering can be used since acquire ordering when
             // `head_all` was initially read for this iterator implies acquire
@@ -88,7 +89,7 @@ impl<'a, S> Iterator for IterPinRef<'a, S> {
             let next = (*self.task).spin_next_all(self.pending_next_all, Relaxed);
             self.task = next;
             self.len -= 1;
-            Some(Pin::new_unchecked(stream))
+            Some((task.id, Pin::new_unchecked(stream)))
         }
     }
 
@@ -97,13 +98,13 @@ impl<'a, S> Iterator for IterPinRef<'a, S> {
     }
 }
 
-impl<S> ExactSizeIterator for IterPinRef<'_, S> {}
+impl<S: Unpin> ExactSizeIterator for IterPinRef<'_, S> {}
 
 impl<'a, S: Unpin> Iterator for Iter<'a, S> {
-    type Item = &'a S;
+    type Item = (usize, &'a S);
 
-    fn next(&mut self) -> Option<&'a S> {
-        self.0.next().map(Pin::get_ref)
+    fn next(&mut self) -> Option<(usize, &'a S)> {
+        self.0.next().map(|(token, s)| (token, Pin::get_ref(s)))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {

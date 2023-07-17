@@ -55,7 +55,7 @@ use futures_util::task::{ArcWake, AtomicWaker};
 mod abort;
 
 mod iter;
-pub use self::iter::{IterMut, IterPinMut};
+pub use self::iter::{Iter, IterMut, IterPinMut, IterPinRef};
 
 mod task;
 use self::task::Task;
@@ -424,6 +424,34 @@ impl<S> StreamUnordered<S> {
         })
     }
 
+    /// Returns an immutable iterator that allows getting a reference to each stream in the set.
+    pub fn iter(&self) -> Iter<'_, S>
+    where
+        S: Unpin,
+    {
+        Iter(Pin::new(self).iter_pin())
+    }
+
+    /// Returns an immutable iterator that allows getting a reference to each stream in the set.
+    pub fn iter_pin(self: Pin<&Self>) -> IterPinRef<'_, S> {
+        // // `head_all` can be accessed directly and we don't need to spin on
+        // // `Task::next_all` since we have exclusive access to the set.
+        // let task = &*self.head_all;
+        // let len = if task.is_null() {
+        //     0
+        // } else {
+        //     unsafe { *(*task).len_all.get() }
+        // };
+
+        // IterPinRef {
+        //     task,
+        //     len,
+        //     pending_next_all: self.pending_next_all(),
+        //     _marker: PhantomData,
+        // }
+        todo!();
+    }
+
     /// Returns an iterator that allows modifying each stream in the set.
     pub fn iter_mut(&mut self) -> IterMut<'_, S>
     where
@@ -433,21 +461,8 @@ impl<S> StreamUnordered<S> {
     }
 
     /// Returns an iterator that allows modifying each stream in the set.
-    pub fn iter_pin_mut(mut self: Pin<&mut Self>) -> IterPinMut<'_, S> {
-        // `head_all` can be accessed directly and we don't need to spin on
-        // `Task::next_all` since we have exclusive access to the set.
-        let task = *self.head_all.get_mut();
-        let len = if task.is_null() {
-            0
-        } else {
-            unsafe { *(*task).len_all.get() }
-        };
-
-        IterPinMut {
-            task,
-            len,
-            _marker: PhantomData,
-        }
+    pub fn iter_pin_mut(self: Pin<&mut Self>) -> IterPinMut<'_, S> {
+        todo!();
     }
 
     /// Returns the current head node and number of streams in the list of all
@@ -941,6 +956,15 @@ impl<S> Drop for StreamUnordered<S> {
         // happen while there's a strong refcount held.
     }
 }
+
+// impl<'a, S: Stream + Unpin + 'a> IntoIterator for &'a StreamUnordered<S> {
+//     type Item = (usize, &'a S);
+//     type IntoIter = Iter<'a, S>;
+
+//     fn into_iter(self) -> Self::IntoIter {
+//         Iter(Self::iter)
+//     }
+// }
 
 impl<S: Stream> FromIterator<S> for StreamUnordered<S> {
     fn from_iter<I>(iter: I) -> Self
