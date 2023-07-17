@@ -41,7 +41,6 @@ use alloc::sync::{Arc, Weak};
 use core::cell::UnsafeCell;
 use core::fmt::{self, Debug};
 use core::iter::FromIterator;
-use core::marker::PhantomData;
 use core::mem;
 use core::ops::{Index, IndexMut};
 use core::pin::Pin;
@@ -51,6 +50,7 @@ use core::sync::atomic::{AtomicBool, AtomicPtr};
 use futures_core::stream::{FusedStream, Stream};
 use futures_core::task::{Context, Poll};
 use futures_util::task::{ArcWake, AtomicWaker};
+use std::marker::PhantomData;
 
 mod abort;
 
@@ -461,8 +461,21 @@ impl<S> StreamUnordered<S> {
     }
 
     /// Returns an iterator that allows modifying each stream in the set.
-    pub fn iter_pin_mut(self: Pin<&mut Self>) -> IterPinMut<'_, S> {
-        todo!();
+    pub fn iter_pin_mut(mut self: Pin<&mut Self>) -> IterPinMut<'_, S> {
+        // `head_all` can be accessed directly and we don't need to spin on
+        // `Task::next_all` since we have exclusive access to the set.
+        let task = *self.head_all.get_mut();
+        let len = if task.is_null() {
+            0
+        } else {
+            unsafe { *(*task).len_all.get() }
+        };
+
+        IterPinMut {
+            task,
+            len,
+            _marker: PhantomData,
+        }
     }
 
     /// Returns the current head node and number of streams in the list of all
@@ -956,15 +969,6 @@ impl<S> Drop for StreamUnordered<S> {
         // happen while there's a strong refcount held.
     }
 }
-
-// impl<'a, S: Stream + Unpin + 'a> IntoIterator for &'a StreamUnordered<S> {
-//     type Item = (usize, &'a S);
-//     type IntoIter = Iter<'a, S>;
-
-//     fn into_iter(self) -> Self::IntoIter {
-//         Iter(Self::iter)
-//     }
-// }
 
 impl<S: Stream> FromIterator<S> for StreamUnordered<S> {
     fn from_iter<I>(iter: I) -> Self
