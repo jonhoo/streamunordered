@@ -50,13 +50,12 @@ use core::sync::atomic::{AtomicBool, AtomicPtr};
 use futures_core::stream::{FusedStream, Stream};
 use futures_core::task::{Context, Poll};
 use futures_util::task::{ArcWake, AtomicWaker};
-use iter::IterMutWithToken;
 use std::marker::PhantomData;
 
 mod abort;
 
 mod iter;
-pub use self::iter::{IterMut, IterPinMut, IterPinMutWithToken, IterWithToken};
+pub use self::iter::{IterMut, IterMutWithToken, IterPinMut, IterPinMutWithToken, IterWithToken};
 
 mod task;
 use self::task::Task;
@@ -466,13 +465,7 @@ impl<S> StreamUnordered<S> {
 
     /// Returns an immutable iterator that allows getting a reference to each stream in the set.
     pub fn iter_with_token(&self) -> IterWithToken<'_, S> {
-        let task = unsafe { *self.head_all.as_ptr() };
-        let len = if task.is_null() {
-            0
-        } else {
-            unsafe { *(*task).len_all.get() }
-        };
-
+        let (task, len) = self.atomic_load_head_and_len_all();
         IterWithToken {
             task,
             len,

@@ -13,8 +13,6 @@ pub struct IterPinMutWithToken<'a, S> {
 }
 
 /// Mutable iterator over all streams in the unordered set.
-///
-// Unfortunately, this ended up in the public API so remains to maintain backwards compatibility
 #[derive(Debug)]
 pub struct IterPinMut<'a, S>(pub(super) IterPinMutWithToken<'a, S>);
 
@@ -114,9 +112,8 @@ impl<'a, S> Iterator for IterWithToken<'a, S> {
             return None;
         }
         unsafe {
-            let task = &*self.task;
-            let id = (*task).id;
-            let stream = (*task.stream.get()).as_ref().unwrap();
+            let id = (*self.task).id;
+            let stream = (*(*self.task).stream.get()).as_ref().unwrap();
 
             // Relaxed ordering can be used since acquire ordering when
             // `head_all` was initially read for this iterator implies acquire
