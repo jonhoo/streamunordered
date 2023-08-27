@@ -41,6 +41,7 @@ use alloc::sync::{Arc, Weak};
 use core::cell::UnsafeCell;
 use core::fmt::{self, Debug};
 use core::iter::FromIterator;
+use core::marker::PhantomData;
 use core::mem;
 use core::ops::{Index, IndexMut};
 use core::pin::Pin;
@@ -50,7 +51,6 @@ use core::sync::atomic::{AtomicBool, AtomicPtr};
 use futures_core::stream::{FusedStream, Stream};
 use futures_core::task::{Context, Poll};
 use futures_util::task::{ArcWake, AtomicWaker};
-use std::marker::PhantomData;
 
 mod abort;
 
