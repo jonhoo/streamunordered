@@ -1,4 +1,4 @@
-use async_bincode::*;
+use async_bincode::{AsyncBincodeStream, AsyncDestination};
 use futures::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;

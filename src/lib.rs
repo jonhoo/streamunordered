@@ -30,7 +30,7 @@
 //! `StreamYield::Finished`, its token may be reused for new streams that are added.
 
 #![deny(missing_docs)]
-#![warn(rust_2018_idioms, broken_intra_doc_links)]
+#![warn(rust_2018_idioms, rustdoc::broken_intra_doc_links)]
 
 // This is mainly FuturesUnordered from futures_util, but adapted to operate over Streams rather
 // than Futures.
@@ -55,7 +55,7 @@ use futures_util::task::{ArcWake, AtomicWaker};
 mod abort;
 
 mod iter;
-pub use self::iter::{IterMut, IterPinMut};
+pub use self::iter::{IterMut, IterMutWithToken, IterPinMut, IterPinMutWithToken, IterWithToken};
 
 mod task;
 use self::task::Task;
@@ -429,11 +429,24 @@ impl<S> StreamUnordered<S> {
     where
         S: Unpin,
     {
-        IterMut(Pin::new(self).iter_pin_mut())
+        IterMut(Pin::new(self).iter_pin_mut_with_token())
     }
 
     /// Returns an iterator that allows modifying each stream in the set.
-    pub fn iter_pin_mut(mut self: Pin<&mut Self>) -> IterPinMut<'_, S> {
+    pub fn iter_mut_with_token(&mut self) -> IterMutWithToken<'_, S>
+    where
+        S: Unpin,
+    {
+        IterMutWithToken(Pin::new(self).iter_pin_mut_with_token())
+    }
+
+    /// Returns an iterator that allows modifying each stream in the set.
+    pub fn iter_pin_mut(self: Pin<&mut Self>) -> IterPinMut<'_, S> {
+        IterPinMut(self.iter_pin_mut_with_token())
+    }
+
+    /// Returns an iterator that allows modifying each stream in the set.
+    pub fn iter_pin_mut_with_token(mut self: Pin<&mut Self>) -> IterPinMutWithToken<'_, S> {
         // `head_all` can be accessed directly and we don't need to spin on
         // `Task::next_all` since we have exclusive access to the set.
         let task = *self.head_all.get_mut();
@@ -443,9 +456,20 @@ impl<S> StreamUnordered<S> {
             unsafe { *(*task).len_all.get() }
         };
 
-        IterPinMut {
+        IterPinMutWithToken {
             task,
             len,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Returns an immutable iterator that allows getting a reference to each stream in the set.
+    pub fn iter_with_token(&self) -> IterWithToken<'_, S> {
+        let (task, len) = self.atomic_load_head_and_len_all();
+        IterWithToken {
+            task,
+            len,
+            pending_next_all: self.pending_next_all(),
             _marker: PhantomData,
         }
     }
