@@ -247,7 +247,7 @@ impl<S> StreamUnordered<S> {
     /// This function is useful when creating values that must contain their stream token. The
     /// returned `StreamEntry` reserves an entry for the stream and is able to query the associated
     /// token.
-    pub fn stream_entry<'a>(&'a mut self) -> StreamEntry<'a, S> {
+    pub fn stream_entry(&mut self) -> StreamEntry<'_, S> {
         let next_all = self.pending_next_all();
         let slot = self.by_id.vacant_entry();
         let token = slot.key();
@@ -379,7 +379,7 @@ impl<S> StreamUnordered<S> {
     }
 
     /// Returns a reference to the stream with the given token
-    pub fn get<'a>(&'a self, token: usize) -> Option<&'a S> {
+    pub fn get(&self, token: usize) -> Option<&S> {
         // don't allow access to the 0th task, since it's not a stream
         if token == 0 {
             return None;
@@ -390,7 +390,7 @@ impl<S> StreamUnordered<S> {
     }
 
     /// Returns a reference that allows modifying the stream with the given token.
-    pub fn get_mut<'a>(&'a mut self, token: usize) -> Option<&'a mut S>
+    pub fn get_mut(&mut self, token: usize) -> Option<&mut S>
     where
         S: Unpin,
     {
@@ -408,7 +408,7 @@ impl<S> StreamUnordered<S> {
     }
 
     /// Returns a pinned reference that allows modifying the stream with the given token.
-    pub fn get_pin_mut<'a>(mut self: Pin<&'a mut Self>, token: usize) -> Option<Pin<&'a mut S>> {
+    pub fn get_pin_mut(mut self: Pin<&mut Self>, token: usize) -> Option<Pin<&mut S>> {
         // don't allow access to the 0th task, since it's not a stream
         if token == 0 {
             return None;
@@ -732,7 +732,7 @@ where
 {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (&StreamYield::Item(ref s), &StreamYield::Item(ref o)) => s == o,
+            (StreamYield::Item(s), StreamYield::Item(o)) => s == o,
             _ => false,
         }
     }
