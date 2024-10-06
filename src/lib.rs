@@ -98,7 +98,7 @@ const YIELD_EVERY: usize = 32;
 /// [`collect`](Iterator::collect) method, or you can start with an empty set
 /// with the [`StreamUnordered::new`] constructor.
 #[must_use = "streams do nothing unless polled"]
-pub struct StreamUnordered<S> {
+pub struct StreamUnordered<S: 'static> {
     ready_to_run_queue: Arc<ReadyToRunQueue<S>>,
     head_all: AtomicPtr<Task<S>>,
     is_terminated: AtomicBool,
@@ -138,7 +138,7 @@ impl<S> Unpin for StreamUnordered<S> {}
 ///
 /// `StreamEntry` allows constructing streams that hold the token that they will be assigned.
 #[derive(Debug)]
-pub struct StreamEntry<'a, S> {
+pub struct StreamEntry<'a, S: 'static> {
     token: usize,
     inserted: bool,
     backref: &'a mut StreamUnordered<S>,
@@ -167,7 +167,7 @@ impl<'a, S: 'a> StreamEntry<'a, S> {
     }
 }
 
-impl<'a, S: 'a> Drop for StreamEntry<'a, S> {
+impl<'a, S: 'a + 'static> Drop for StreamEntry<'a, S> {
     fn drop(&mut self) {
         if !self.inserted {
             // undo the insertion
@@ -226,7 +226,7 @@ impl<S: Stream> Default for StreamUnordered<S> {
     }
 }
 
-impl<S> StreamUnordered<S> {
+impl<S: 'static> StreamUnordered<S> {
     /// Returns the number of streams contained in the set.
     ///
     /// This represents the total number of in-flight streams.
@@ -636,7 +636,7 @@ impl<S> StreamUnordered<S> {
     }
 }
 
-impl<S> Index<usize> for StreamUnordered<S> {
+impl<S: 'static> Index<usize> for StreamUnordered<S> {
     type Output = S;
 
     fn index(&self, stream: usize) -> &Self::Output {
@@ -836,7 +836,7 @@ impl<S: Stream> Stream for StreamUnordered<S> {
             // * We unlink the task from our internal queue to preemptively
             //   assume it'll panic, in which case we'll want to discard it
             //   regardless.
-            struct Bomb<'a, S> {
+            struct Bomb<'a, S: 'static> {
                 queue: &'a mut StreamUnordered<S>,
                 task: Option<Arc<Task<S>>>,
             }

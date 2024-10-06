@@ -6,7 +6,7 @@ use core::sync::atomic::Ordering::Relaxed;
 
 /// Mutable iterator over all streams in the unordered set.
 #[derive(Debug)]
-pub struct IterPinMutWithToken<'a, S> {
+pub struct IterPinMutWithToken<'a, S: 'static> {
     pub(super) task: *const Task<S>,
     pub(super) len: usize,
     pub(super) _marker: PhantomData<&'a mut StreamUnordered<S>>,
@@ -14,19 +14,19 @@ pub struct IterPinMutWithToken<'a, S> {
 
 /// Mutable iterator over all streams in the unordered set.
 #[derive(Debug)]
-pub struct IterPinMut<'a, S>(pub(super) IterPinMutWithToken<'a, S>);
+pub struct IterPinMut<'a, S: 'static>(pub(super) IterPinMutWithToken<'a, S>);
 
 /// Mutable iterator over all streams in the unordered set.
 #[derive(Debug)]
-pub struct IterMutWithToken<'a, S: Unpin>(pub(super) IterPinMutWithToken<'a, S>);
+pub struct IterMutWithToken<'a, S: Unpin + 'static>(pub(super) IterPinMutWithToken<'a, S>);
 
 /// Mutable iterator over all streams in the unordered set.
 #[derive(Debug)]
-pub struct IterMut<'a, S: Unpin>(pub(super) IterPinMutWithToken<'a, S>);
+pub struct IterMut<'a, S: Unpin + 'static>(pub(super) IterPinMutWithToken<'a, S>);
 
 /// Immutable iterator over all streams in the unordered set.
 #[derive(Debug)]
-pub struct IterWithToken<'a, S> {
+pub struct IterWithToken<'a, S: 'static> {
     pub(super) task: *const Task<S>,
     pub(super) len: usize,
     pub(super) pending_next_all: *mut Task<S>,
@@ -104,7 +104,7 @@ impl<'a, S: Unpin> Iterator for IterMutWithToken<'a, S> {
 
 impl<S: Unpin> ExactSizeIterator for IterMutWithToken<'_, S> {}
 
-impl<'a, S> Iterator for IterWithToken<'a, S> {
+impl<'a, S:'static> Iterator for IterWithToken<'a, S> {
     type Item = (&'a S, usize);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -131,4 +131,4 @@ impl<'a, S> Iterator for IterWithToken<'a, S> {
     }
 }
 
-impl<S> ExactSizeIterator for IterWithToken<'_, S> {}
+impl<S: 'static> ExactSizeIterator for IterWithToken<'_, S> {}
