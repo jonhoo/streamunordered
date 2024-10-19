@@ -738,7 +738,7 @@ where
     }
 }
 
-impl<S: Stream> Stream for StreamUnordered<S> {
+impl<S: Stream + 'static> Stream for StreamUnordered<S> {
     type Item = (StreamYield<S>, usize);
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -979,7 +979,7 @@ impl<S: Stream> FromIterator<S> for StreamUnordered<S> {
     }
 }
 
-impl<S: Stream> FusedStream for StreamUnordered<S> {
+impl<S: Stream + 'static> FusedStream for StreamUnordered<S> {
     fn is_terminated(&self) -> bool {
         self.is_terminated.load(Relaxed)
     }
