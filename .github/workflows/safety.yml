@@ -62,4 +62,4 @@ jobs:
       - name: cargo miri test
         run: cargo miri test
         env:
-          MIRIFLAGS: ""
+          MIRIFLAGS: "-Zmiri-tree-borrows"

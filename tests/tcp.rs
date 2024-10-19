@@ -1,3 +1,5 @@
+#![cfg(not(miri))] // https://github.com/rust-lang/miri/issues/2057
+
 use async_bincode::{tokio::AsyncBincodeStream, AsyncDestination};
 use futures::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
