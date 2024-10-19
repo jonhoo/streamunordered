@@ -74,12 +74,14 @@ impl<S> ArcWake for Task<S> {
     }
 }
 
-impl<S> Task<S> {
+impl<S: 'static> Task<S> {
     /// Returns a waker reference for this task without cloning the Arc.
     pub(super) fn waker_ref(this: &Arc<Task<S>>) -> WakerRef<'_> {
         waker_ref(this)
     }
+}
 
+impl<S> Task<S> {
     /// Spins until `next_all` is no longer set to `pending_next_all`.
     ///
     /// The temporary `pending_next_all` value is typically overwritten fairly
