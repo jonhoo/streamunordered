@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/streamunordered.svg)](https://crates.io/crates/streamunordered)
 [![Documentation](https://docs.rs/streamunordered/badge.svg)](https://docs.rs/streamunordered/)
-[![Build Status](https://travis-ci.org/jonhoo/streamunordered.svg?branch=master)](https://travis-ci.org/jonhoo/streamunordered)
+[![codecov](https://codecov.io/gh/jonhoo/streamunordered/graph/badge.svg?token=6uBkjo5m1D)](https://codecov.io/gh/jonhoo/streamunordered)
 
 A stream that efficiently multiplexes multiple streams.
 
