@@ -27,7 +27,7 @@ impl Echoer {
         }
     }
 
-    fn try_new(&mut self, cx: &mut Context<'_>) -> bincode::Result<()> {
+    fn try_new(&mut self, cx: &mut Context<'_>) -> anyhow::Result<()> {
         while let Poll::Ready((stream, _)) = self.incoming.poll_accept(cx)? {
             let slot = self.inputs.stream_entry();
             let tcp = AsyncBincodeStream::from(stream).for_async();
@@ -36,7 +36,7 @@ impl Echoer {
         Ok(())
     }
 
-    fn try_flush(&mut self, cx: &mut Context<'_>) -> bincode::Result<()> {
+    fn try_flush(&mut self, cx: &mut Context<'_>) -> anyhow::Result<()> {
         // start sending new things
         for (&stream, out) in &mut self.out {
             let s = &mut self.inputs[stream];
@@ -72,7 +72,7 @@ impl Echoer {
         );
 
         if !err.is_empty() {
-            Err(err.swap_remove(0))
+            anyhow::bail!(err.swap_remove(0))
         } else {
             Ok(())
         }
