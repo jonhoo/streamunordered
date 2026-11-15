@@ -4,6 +4,7 @@ version = "0.5.6"
 authors = ["Jon Gjengset <jon@thesquareplanet.com>"]
 license = "MIT/Apache-2.0"
 edition = "2018"
+rust-version = "1.71.1"
 
 description = "An efficient async stream multiplexer"
 readme = "README.md"
